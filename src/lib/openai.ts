@@ -81,11 +81,16 @@ Your task is to take the user's style guide and presentation notes and create a 
 
 Rules:
 - Create slides based on the presentation notes provided, using the highlighted note segments as the content for each slide
+- Use ONLY wording from the provided highlighted note segments; do not add new facts, transitions, explanations, or commentary
+- Do not paraphrase highlighted text; keep slide text as direct excerpts from the provided segments
 - Follow the style guide instructions carefully
+- Let the style guide and template visuals determine text structure for each slide:
+  - If the design indicates a single text element, use one populated field (typically body) and leave the other empty
+  - If the design indicates a heading + body treatment, split content across title/body using only words from the segment
+  - Do not force a title when the style guide or template does not call for one
 - Keep slide content brief — each slide should be easily readable at a glance
 - Use simple, direct language appropriate for on-screen projection
 - The caller may provide an exact required slide count; when provided, create exactly that many slides
-- Each slide title should be based on a portion of highlighted content from the notes.
 - If notes include a section named "Parsed Highlighted Non-Scripture Points", create point-focused slides from those items and do not treat scripture references as points unless explicitly asked
 - Classify each slide with a slideType value:
   - "point": teaching points, takeaways, application statements
@@ -96,25 +101,11 @@ Rules:
 - Keep text boxes inside slide bounds
 - If template rectangles are visible, place titleBox/bodyBox to match those rectangles
 - If no clear rectangle exists, use a readable default centered region
+- For single-text designs, prioritize one main text box and leave the unused text field empty
 - Include align for titleBox/bodyBox when relevant
-
-Respond ONLY with valid JSON in this exact format, with no additional text or markdown:
-{
-  "slides": [
-    {
-      "title": "Slide Title",
-      "body": "Slide body text.\nSecond line if needed.",
-      "notes": "Optional presenter notes for this slide.",
-      "slideType": "point",
-      "layout": {
-        "titleBox": { "x": 10, "y": 12, "width": 80, "height": 14, "align": "left" },
-        "bodyBox": { "x": 10, "y": 30, "width": 80, "height": 52, "align": "left" },
-        "textColor": "#FFFFFF",
-        "titleFontSize": 60,
-        "bodyFontSize": 40
-      }
-    }
-  ]
+- Provide titleFontSize and bodyFontSize in the layout, using the style guide or template as a reference for relative sizing between title and body
+- Use the Gotham bold font for titles and Gotham book for all text
+- Return output as valid json only, as a single object with this exact top-level shape: {"slides": [...]}.
 }`;
 
 interface NoteSegment {
@@ -426,6 +417,11 @@ Slide Count Rules:
 - Create exactly ${batchSlideCount} slides for this batch.
 - Use the note segments in order, with one primary segment per slide.
 - Do not merge multiple segments into one slide unless required by very short/duplicate content.
+
+Content Constraints:
+- Use only text that appears in the Structured Note Segments listed below.
+- Do not introduce any new wording beyond those segments.
+- Keep each slide tied to its primary segment text.
 
 Structured Note Segments (ordered):
 ${segmentListText}

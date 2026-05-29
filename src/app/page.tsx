@@ -1,32 +1,45 @@
 "use client";
 
 import Image from "next/image";
-import { useState, useRef, ChangeEvent } from "react";
+import { useEffect, useState, useRef, ChangeEvent } from "react";
+
+type BoxAlign = "left" | "center" | "right";
+
+interface LayoutBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  align?: BoxAlign;
+}
+
+interface SlideLayout {
+  titleBox?: LayoutBox;
+  bodyBox?: LayoutBox;
+  textColor?: string;
+  titleFontSize?: number;
+  bodyFontSize?: number;
+}
+
+interface ResolvedSlideLayout {
+  titleBox: LayoutBox & { align: BoxAlign };
+  bodyBox: LayoutBox & { align: BoxAlign };
+  textColor: string;
+  titleFontSize: number;
+  bodyFontSize: number;
+}
+
+type SlideBoxKey = "titleBox" | "bodyBox";
+type BoxInteractionMode = "move" | "resize-nw" | "resize-ne" | "resize-sw" | "resize-se";
 
 interface Slide {
   title: string;
   body: string;
   notes?: string;
   slideType?: "point" | "scripture" | "other";
-  layout?: {
-    titleBox?: {
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      align?: "left" | "center" | "right";
-    };
-    bodyBox?: {
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      align?: "left" | "center" | "right";
-    };
-    textColor?: string;
-    titleFontSize?: number;
-    bodyFontSize?: number;
-  };
+  showTitle?: boolean;
+  showBody?: boolean;
+  layout?: SlideLayout;
 }
 
 interface GenerateResponse {
@@ -49,48 +62,121 @@ function toPx(percent: number, full: number): number {
   return Math.round((percent / 100) * full);
 }
 
-function getSlideLayout(slide: Slide): {
-  titleBox: { x: number; y: number; width: number; height: number; align: "left" | "center" | "right" };
-  bodyBox: { x: number; y: number; width: number; height: number; align: "left" | "center" | "right" };
-  textColor: string;
-  titleFontSize: number;
-  bodyFontSize: number;
-} {
-  const defaultTitle = { x: 10, y: 10, width: 80, height: 14, align: "left" as const };
-  const defaultBody = { x: 10, y: 28, width: 80, height: 54, align: "left" as const };
-  const modelTitleBox = slide.layout?.titleBox
-    ? {
-        x: slide.layout.titleBox.x,
-        y: slide.layout.titleBox.y,
-        width: slide.layout.titleBox.width,
-        height: slide.layout.titleBox.height,
-        align: slide.layout.titleBox.align ?? "left",
-      }
-    : defaultTitle;
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
 
-  const modelBodyBox = slide.layout?.bodyBox
-    ? {
-        x: slide.layout.bodyBox.x,
-        y: slide.layout.bodyBox.y,
-        width: slide.layout.bodyBox.width,
-        height: slide.layout.bodyBox.height,
-        align: slide.layout.bodyBox.align ?? "left",
-      }
-      : defaultBody;
+function roundPercent(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+function normalizeBox(box: LayoutBox | undefined, defaults: LayoutBox): Required<LayoutBox> {
+  const width = roundPercent(clamp(box?.width ?? defaults.width, 5, 100));
+  const height = roundPercent(clamp(box?.height ?? defaults.height, 5, 100));
+  const x = roundPercent(clamp(box?.x ?? defaults.x, 0, 100 - width));
+  const y = roundPercent(clamp(box?.y ?? defaults.y, 0, 100 - height));
 
   return {
-    titleBox: modelTitleBox,
-    bodyBox: modelBodyBox,
-    textColor: slide.layout?.textColor ?? "#FFFFFF",
-    titleFontSize: slide.layout?.titleFontSize ?? 60,
-    bodyFontSize: slide.layout?.bodyFontSize ?? 40,
+    x,
+    y,
+    width,
+    height,
+    align: box?.align ?? defaults.align ?? "left",
   };
+}
+
+function buildEditableLayout(layout?: SlideLayout): ResolvedSlideLayout {
+  const defaultTitle = { x: 10, y: 10, width: 80, height: 14, align: "left" as const };
+  const defaultBody = { x: 10, y: 28, width: 80, height: 54, align: "left" as const };
+
+  return {
+    titleBox: normalizeBox(layout?.titleBox, defaultTitle),
+    bodyBox: normalizeBox(layout?.bodyBox, defaultBody),
+    textColor: layout?.textColor ?? "#FFFFFF",
+    titleFontSize: clamp(layout?.titleFontSize ?? 60, 18, 180),
+    bodyFontSize: clamp(layout?.bodyFontSize ?? 40, 18, 180),
+  };
+}
+
+function adjustBoxFromInteraction(
+  box: LayoutBox & { align: BoxAlign },
+  mode: BoxInteractionMode,
+  deltaXPercent: number,
+  deltaYPercent: number
+): LayoutBox & { align: BoxAlign } {
+  const minWidth = 5;
+  const minHeight = 5;
+  const startRight = box.x + box.width;
+  const startBottom = box.y + box.height;
+
+  if (mode === "move") {
+    return {
+      ...box,
+      x: roundPercent(clamp(box.x + deltaXPercent, 0, 100 - box.width)),
+      y: roundPercent(clamp(box.y + deltaYPercent, 0, 100 - box.height)),
+    };
+  }
+
+  if (mode === "resize-nw") {
+    const x = roundPercent(clamp(box.x + deltaXPercent, 0, startRight - minWidth));
+    const y = roundPercent(clamp(box.y + deltaYPercent, 0, startBottom - minHeight));
+    return {
+      ...box,
+      x,
+      y,
+      width: roundPercent(startRight - x),
+      height: roundPercent(startBottom - y),
+    };
+  }
+
+  if (mode === "resize-ne") {
+    const right = roundPercent(clamp(startRight + deltaXPercent, box.x + minWidth, 100));
+    const y = roundPercent(clamp(box.y + deltaYPercent, 0, startBottom - minHeight));
+    return {
+      ...box,
+      y,
+      width: roundPercent(right - box.x),
+      height: roundPercent(startBottom - y),
+    };
+  }
+
+  if (mode === "resize-sw") {
+    const x = roundPercent(clamp(box.x + deltaXPercent, 0, startRight - minWidth));
+    const bottom = roundPercent(clamp(startBottom + deltaYPercent, box.y + minHeight, 100));
+    return {
+      ...box,
+      x,
+      width: roundPercent(startRight - x),
+      height: roundPercent(bottom - box.y),
+    };
+  }
+
+  const right = roundPercent(clamp(startRight + deltaXPercent, box.x + minWidth, 100));
+  const bottom = roundPercent(clamp(startBottom + deltaYPercent, box.y + minHeight, 100));
+  return {
+    ...box,
+    width: roundPercent(right - box.x),
+    height: roundPercent(bottom - box.y),
+  };
+}
+
+function getSlideLayout(slide: Slide): ResolvedSlideLayout {
+  return buildEditableLayout(slide.layout);
 }
 
 function getTemplateRoleLabel(index: number): string {
   if (index === 0) return "Point template";
   if (index === 1) return "Scripture template";
   return `Additional template ${index + 1}`;
+}
+
+function hasSlideText(slide: Slide, field: "title" | "body"): boolean {
+  return slide[field].trim().length > 0;
+}
+
+function isSlideTextVisible(slide: Slide, field: "title" | "body"): boolean {
+  if (!hasSlideText(slide, field)) return false;
+  return field === "title" ? slide.showTitle !== false : slide.showBody !== false;
 }
 
 export default function Home() {
@@ -107,6 +193,8 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [slides, setSlides] = useState<Slide[] | null>(null);
+  const [selectedSlideIndex, setSelectedSlideIndex] = useState(0);
+  const [approvedSlides, setApprovedSlides] = useState<boolean[]>([]);
   const [downloading, setDownloading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const templateSlideInputRef = useRef<HTMLInputElement>(null);
@@ -232,7 +320,15 @@ export default function Home() {
       if (!res.ok || data.error) {
         setError(data.error ?? "Failed to generate slides.");
       } else {
-        setSlides(data.slides ?? []);
+        const nextSlides = (data.slides ?? []).map((slide) => ({
+          ...slide,
+          showTitle: hasSlideText(slide, "title"),
+          showBody: hasSlideText(slide, "body"),
+          layout: buildEditableLayout(slide.layout),
+        }));
+        setSlides(nextSlides);
+        setSelectedSlideIndex(0);
+        setApprovedSlides(nextSlides.map(() => false));
       }
     } catch {
       setError("Network error. Please try again.");
@@ -298,6 +394,8 @@ export default function Home() {
           ctx.fillRect(0, 0, W, H);
         }
 
+        const showTitle = isSlideTextVisible(slide, "title");
+        const showBody = isSlideTextVisible(slide, "body");
         const titleX = toPx(layout.titleBox.x, W);
         const titleY = toPx(layout.titleBox.y, H);
         const titleW = toPx(layout.titleBox.width, W);
@@ -314,7 +412,7 @@ export default function Home() {
         ctx.textBaseline = "top";
 
         // Title
-        if (slide.title) {
+        if (showTitle) {
           ctx.fillStyle = resolvedTextColor;
           ctx.font = `bold ${layout.titleFontSize}px Arial`;
           ctx.textAlign = layout.titleBox.align;
@@ -333,7 +431,7 @@ export default function Home() {
         }
 
         // Body
-        if (slide.body) {
+        if (showBody) {
           ctx.fillStyle = resolvedTextColor;
           ctx.font = `${layout.bodyFontSize}px Arial`;
           ctx.textAlign = layout.bodyBox.align;
@@ -385,8 +483,8 @@ export default function Home() {
         body: JSON.stringify({
           presentationTitle,
           slides: slides.map((slide) => ({
-            title: slide.title,
-            body: slide.body,
+            title: isSlideTextVisible(slide, "title") ? slide.title : "",
+            body: isSlideTextVisible(slide, "body") ? slide.body : "",
             notes: slide.notes,
             layout: slide.layout,
           })),
@@ -412,6 +510,164 @@ export default function Home() {
       setDownloading(false);
     }
   }
+
+  function updateSlideLayout(index: number, nextLayout: SlideLayout) {
+    setSlides((currentSlides) => {
+      if (!currentSlides) return currentSlides;
+      return currentSlides.map((slide, slideIndex) =>
+        slideIndex === index
+          ? {
+              ...slide,
+              layout: buildEditableLayout(nextLayout),
+            }
+          : slide
+      );
+    });
+
+    setApprovedSlides((currentApprovals) =>
+      currentApprovals.map((approved, slideIndex) => (slideIndex === index ? false : approved))
+    );
+  }
+
+  function updateSlideBox(
+    index: number,
+    boxKey: "titleBox" | "bodyBox",
+    field: keyof LayoutBox,
+    rawValue: string
+  ) {
+    const parsedValue = field === "align" ? rawValue : Number(rawValue);
+    if (field !== "align" && Number.isNaN(parsedValue)) return;
+
+    const currentSlide = slides?.[index];
+    if (!currentSlide) return;
+
+    const currentLayout = getSlideLayout(currentSlide);
+    const nextBox: LayoutBox = {
+      ...currentLayout[boxKey],
+      [field]: parsedValue,
+    } as LayoutBox;
+
+    updateSlideLayout(index, {
+      ...currentLayout,
+      [boxKey]: normalizeBox(nextBox, currentLayout[boxKey]),
+    });
+  }
+
+  function updateSlideStyleField(
+    index: number,
+    field: "textColor" | "titleFontSize" | "bodyFontSize",
+    rawValue: string
+  ) {
+    const currentSlide = slides?.[index];
+    if (!currentSlide) return;
+
+    const currentLayout = getSlideLayout(currentSlide);
+    if (field === "textColor") {
+      updateSlideLayout(index, {
+        ...currentLayout,
+        textColor: rawValue || "#FFFFFF",
+      });
+      return;
+    }
+
+    const parsedValue = Number(rawValue);
+    if (Number.isNaN(parsedValue)) return;
+
+    updateSlideLayout(index, {
+      ...currentLayout,
+      [field]: clamp(Math.round(parsedValue), 18, 180),
+    });
+  }
+
+  function applyCurrentFontSizesToAllSlides(index: number) {
+    const sourceSlide = slides?.[index];
+    if (!sourceSlide) return;
+
+    const sourceLayout = getSlideLayout(sourceSlide);
+
+    setSlides((currentSlides) => {
+      if (!currentSlides) return currentSlides;
+
+      return currentSlides.map((slide) => {
+        const currentLayout = getSlideLayout(slide);
+        return {
+          ...slide,
+          layout: buildEditableLayout({
+            ...currentLayout,
+            titleFontSize: sourceLayout.titleFontSize,
+            bodyFontSize: sourceLayout.bodyFontSize,
+          }),
+        };
+      });
+    });
+
+    setApprovedSlides((currentApprovals) => currentApprovals.map(() => false));
+  }
+
+  function updateSlideVisibility(index: number, field: "title" | "body", visible: boolean) {
+    setSlides((currentSlides) => {
+      if (!currentSlides) return currentSlides;
+      return currentSlides.map((slide, slideIndex) => {
+        if (slideIndex !== index) return slide;
+
+        return field === "title"
+          ? { ...slide, showTitle: visible }
+          : { ...slide, showBody: visible };
+      });
+    });
+
+    setApprovedSlides((currentApprovals) =>
+      currentApprovals.map((approved, slideIndex) => (slideIndex === index ? false : approved))
+    );
+  }
+
+  function resetSlideLayout(index: number) {
+    const currentSlide = slides?.[index];
+    if (!currentSlide) return;
+
+    updateSlideLayout(index, buildEditableLayout(undefined));
+  }
+
+  function applyLayoutToMatchingSlides(index: number) {
+    const currentSlide = slides?.[index];
+    if (!slides || !currentSlide) return;
+
+    const sourceLayout = buildEditableLayout(currentSlide.layout);
+    const sourceType = currentSlide.slideType ?? "other";
+
+    setSlides((currentSlides) => {
+      if (!currentSlides) return currentSlides;
+      return currentSlides.map((slide) =>
+        (slide.slideType ?? "other") === sourceType
+          ? {
+              ...slide,
+              layout: sourceLayout,
+            }
+          : slide
+      );
+    });
+
+    setApprovedSlides((currentApprovals) =>
+      currentApprovals.map((approved, slideIndex) => {
+        const slide = slides[slideIndex];
+        return (slide?.slideType ?? "other") === sourceType ? false : approved;
+      })
+    );
+  }
+
+  function approveSlide(index: number) {
+    setApprovedSlides((currentApprovals) =>
+      currentApprovals.map((approved, slideIndex) => (slideIndex === index ? true : approved))
+    );
+  }
+
+  function approveAllSlides() {
+    setApprovedSlides((currentApprovals) => currentApprovals.map(() => true));
+  }
+
+  const approvedCount = approvedSlides.filter(Boolean).length;
+  const allSlidesApproved = slides ? slides.length > 0 && approvedCount === slides.length : false;
+  const selectedSlide = slides?.[selectedSlideIndex] ?? null;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 text-white">
@@ -613,20 +869,20 @@ export default function Home() {
               <button
                 type="button"
                 onClick={downloadPro}
-                disabled={downloading}
+                disabled={downloading || !allSlidesApproved}
                 className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-6 py-2.5 text-sm font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-50"
               >
-                {downloading ? "Preparing .pro…" : "⬇ Download .pro"}
+                {downloading ? "Preparing .pro…" : allSlidesApproved ? "⬇ Download .pro" : "Approve layouts to export .pro"}
               </button>
             )}
             {slides && slides.length > 0 && (
               <button
                 type="button"
                 onClick={downloadPNGs}
-                disabled={downloading}
+                disabled={downloading || !allSlidesApproved}
                 className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-6 py-2.5 text-sm font-semibold text-blue-300 transition hover:bg-blue-500/20 disabled:opacity-50"
               >
-                {downloading ? "Generating PNGs…" : "⬇ Download PNGs"}
+                {downloading ? "Generating PNGs…" : allSlidesApproved ? "⬇ Download PNGs" : "Approve layouts to export PNGs"}
               </button>
             )}
           </div>
@@ -642,6 +898,236 @@ export default function Home() {
         {/* Slide Preview */}
         {slides && slides.length > 0 && (
           <section className="mt-10">
+            <div className="mb-4 rounded-2xl border border-cyan-400/20 bg-cyan-500/10 p-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <h2 className="text-lg font-semibold text-white">
+                    Review and approve layout
+                  </h2>
+                  <p className="text-sm text-cyan-100/80">
+                    Adjust title and body boxes against the template, then approve each slide before exporting.
+                  </p>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <div className="rounded-full border border-white/10 bg-black/20 px-3 py-1 text-sm text-slate-200">
+                    {approvedCount} / {slides.length} approved
+                  </div>
+                  <button
+                    type="button"
+                    onClick={approveAllSlides}
+                    className="rounded-lg border border-white/15 bg-white/5 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/10"
+                  >
+                    Approve all current layouts
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {selectedSlide && (
+              <div className="mb-8 grid gap-6 xl:grid-cols-[minmax(0,1.3fr)_360px]">
+                <LayoutEditorPreview
+                  slide={selectedSlide}
+                  index={selectedSlideIndex}
+                  templateImageDataUrl={resolveTemplateForSlide(selectedSlide, templateSlideImageDataUrls)}
+                  approved={approvedSlides[selectedSlideIndex] ?? false}
+                  onBoxChange={(boxKey, nextBox) => {
+                    const currentLayout = getSlideLayout(selectedSlide);
+                    updateSlideLayout(selectedSlideIndex, {
+                      ...currentLayout,
+                      [boxKey]: nextBox,
+                    });
+                  }}
+                />
+                <aside className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                        Slide {selectedSlideIndex + 1}
+                      </p>
+                      <h3 className="mt-1 text-lg font-semibold text-white">
+                        {selectedSlide.title || "Untitled slide"}
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-400">
+                        {(selectedSlide.slideType ?? "other").toUpperCase()} template mapping
+                      </p>
+                    </div>
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                        approvedSlides[selectedSlideIndex]
+                          ? "bg-emerald-500/15 text-emerald-300"
+                          : "bg-amber-500/15 text-amber-300"
+                      }`}
+                    >
+                      {approvedSlides[selectedSlideIndex] ? "Approved" : "Pending"}
+                    </span>
+                  </div>
+
+                  <div className="mt-4 space-y-4">
+                    <LayoutBoxEditor
+                      title="Title box"
+                      enabled={isSlideTextVisible(selectedSlide, "title")}
+                      hasContent={hasSlideText(selectedSlide, "title")}
+                      box={getSlideLayout(selectedSlide).titleBox}
+                      toggleLabel={isSlideTextVisible(selectedSlide, "title") ? "Hide title" : "Use title"}
+                      onToggle={() =>
+                        updateSlideVisibility(
+                          selectedSlideIndex,
+                          "title",
+                          !isSlideTextVisible(selectedSlide, "title")
+                        )
+                      }
+                      onFieldChange={(field, value) =>
+                        updateSlideBox(selectedSlideIndex, "titleBox", field, value)
+                      }
+                    />
+                    <LayoutBoxEditor
+                      title="Body box"
+                      enabled={isSlideTextVisible(selectedSlide, "body")}
+                      hasContent={hasSlideText(selectedSlide, "body")}
+                      box={getSlideLayout(selectedSlide).bodyBox}
+                      toggleLabel={isSlideTextVisible(selectedSlide, "body") ? "Hide body" : "Use body"}
+                      onToggle={() =>
+                        updateSlideVisibility(
+                          selectedSlideIndex,
+                          "body",
+                          !isSlideTextVisible(selectedSlide, "body")
+                        )
+                      }
+                      onFieldChange={(field, value) =>
+                        updateSlideBox(selectedSlideIndex, "bodyBox", field, value)
+                      }
+                    />
+
+                    <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-sm font-medium text-white">Text styling</p>
+                        <button
+                          type="button"
+                          onClick={() => applyCurrentFontSizesToAllSlides(selectedSlideIndex)}
+                          className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-white/10"
+                        >
+                          Apply font sizes to all slides
+                        </button>
+                      </div>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-3 xl:grid-cols-1">
+                        <label className="text-xs text-slate-400">
+                          Text color
+                          <input
+                            type="color"
+                            value={getSlideLayout(selectedSlide).textColor}
+                            onChange={(e) => updateSlideStyleField(selectedSlideIndex, "textColor", e.target.value)}
+                            className="mt-1 h-10 w-full cursor-pointer rounded-lg border border-white/10 bg-transparent"
+                          />
+                        </label>
+                        <label className="text-xs text-slate-400">
+                          Title font size
+                          <div className="mt-1 flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateSlideStyleField(
+                                  selectedSlideIndex,
+                                  "titleFontSize",
+                                  String(getSlideLayout(selectedSlide).titleFontSize - 2)
+                                )
+                              }
+                              className="rounded-md border border-white/15 bg-white/5 px-2 py-1.5 text-sm text-white transition hover:bg-white/10"
+                            >
+                              -
+                            </button>
+                            <input
+                              type="number"
+                              min={18}
+                              max={180}
+                              value={getSlideLayout(selectedSlide).titleFontSize}
+                              onChange={(e) => updateSlideStyleField(selectedSlideIndex, "titleFontSize", e.target.value)}
+                              className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateSlideStyleField(
+                                  selectedSlideIndex,
+                                  "titleFontSize",
+                                  String(getSlideLayout(selectedSlide).titleFontSize + 2)
+                                )
+                              }
+                              className="rounded-md border border-white/15 bg-white/5 px-2 py-1.5 text-sm text-white transition hover:bg-white/10"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </label>
+                        <label className="text-xs text-slate-400">
+                          Body font size
+                          <div className="mt-1 flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateSlideStyleField(
+                                  selectedSlideIndex,
+                                  "bodyFontSize",
+                                  String(getSlideLayout(selectedSlide).bodyFontSize - 2)
+                                )
+                              }
+                              className="rounded-md border border-white/15 bg-white/5 px-2 py-1.5 text-sm text-white transition hover:bg-white/10"
+                            >
+                              -
+                            </button>
+                            <input
+                              type="number"
+                              min={18}
+                              max={180}
+                              value={getSlideLayout(selectedSlide).bodyFontSize}
+                              onChange={(e) => updateSlideStyleField(selectedSlideIndex, "bodyFontSize", e.target.value)}
+                              className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateSlideStyleField(
+                                  selectedSlideIndex,
+                                  "bodyFontSize",
+                                  String(getSlideLayout(selectedSlide).bodyFontSize + 2)
+                                )
+                              }
+                              className="rounded-md border border-white/15 bg-white/5 px-2 py-1.5 text-sm text-white transition hover:bg-white/10"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+                    <button
+                      type="button"
+                      onClick={() => approveSlide(selectedSlideIndex)}
+                      className="rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400"
+                    >
+                      Approve this slide
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => applyLayoutToMatchingSlides(selectedSlideIndex)}
+                      className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/10"
+                    >
+                      Apply to all {(selectedSlide.slideType ?? "other")} slides
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => resetSlideLayout(selectedSlideIndex)}
+                      className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/10"
+                    >
+                      Reset to default layout
+                    </button>
+                  </div>
+                </aside>
+              </div>
+            )}
+
             <h2 className="mb-4 text-lg font-semibold text-white">
               Preview — {slides.length} slide{slides.length !== 1 ? "s" : ""} generated
             </h2>
@@ -651,6 +1137,9 @@ export default function Home() {
                   key={i}
                   slide={slide}
                   index={i}
+                  approved={approvedSlides[i] ?? false}
+                  selected={selectedSlideIndex === i}
+                  onSelect={() => setSelectedSlideIndex(i)}
                   templateImageDataUrl={resolveTemplateForSlide(slide, templateSlideImageDataUrls)}
                 />
               ))}
@@ -665,16 +1154,39 @@ export default function Home() {
 function SlideCard({
   slide,
   index,
+  approved,
+  selected,
+  onSelect,
   templateImageDataUrl,
 }: {
   slide: Slide;
   index: number;
+  approved: boolean;
+  selected: boolean;
+  onSelect: () => void;
   templateImageDataUrl: string | null;
 }) {
   const [showNotes, setShowNotes] = useState(false);
   const layout = getSlideLayout(slide);
+  const showTitle = isSlideTextVisible(slide, "title");
+  const showBody = isSlideTextVisible(slide, "body");
   return (
-    <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-black shadow-lg">
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onSelect}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
+      className={`flex flex-col overflow-hidden rounded-xl border bg-black text-left shadow-lg transition ${
+        selected
+          ? "border-cyan-400/70 ring-2 ring-cyan-400/30"
+          : "border-white/10 hover:border-white/25"
+      }`}
+    >
       {/* Slide preview (16:9 aspect) */}
       <div
         className="relative flex flex-col items-start justify-start bg-black p-4"
@@ -690,10 +1202,19 @@ function SlideCard({
           />
         )}
         <div className="relative z-10 h-full w-full">
-        <span className="mb-2 text-[10px] font-medium text-slate-600">
-          {index + 1}
-        </span>
-        {slide.title && (
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-[10px] font-medium text-slate-600">
+            {index + 1}
+          </span>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+              approved ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"
+            }`}
+          >
+            {approved ? "Approved" : "Pending"}
+          </span>
+        </div>
+        {showTitle && (
           <p
             className="absolute whitespace-pre-line text-base font-bold leading-snug"
             style={{
@@ -709,7 +1230,7 @@ function SlideCard({
             {slide.title}
           </p>
         )}
-        {slide.body && (
+        {showBody && (
           <p
             className="absolute whitespace-pre-line leading-relaxed"
             style={{
@@ -731,6 +1252,7 @@ function SlideCard({
       {slide.notes && (
         <div className="border-t border-white/10 bg-slate-900/60 px-3 py-2">
           <button
+            type="button"
             onClick={() => setShowNotes((v) => !v)}
             className="text-xs text-slate-500 hover:text-slate-300"
           >
@@ -742,6 +1264,327 @@ function SlideCard({
         </div>
       )}
     </div>
+  );
+}
+
+function LayoutEditorPreview({
+  slide,
+  index,
+  approved,
+  onBoxChange,
+  templateImageDataUrl,
+}: {
+  slide: Slide;
+  index: number;
+  approved: boolean;
+  onBoxChange: (boxKey: SlideBoxKey, nextBox: LayoutBox & { align: BoxAlign }) => void;
+  templateImageDataUrl: string | null;
+}) {
+  const layout = getSlideLayout(slide);
+  const showTitle = isSlideTextVisible(slide, "title");
+  const showBody = isSlideTextVisible(slide, "body");
+  const previewRef = useRef<HTMLDivElement>(null);
+  const [activeInteraction, setActiveInteraction] = useState<{
+    boxKey: SlideBoxKey;
+    mode: BoxInteractionMode;
+    startClientX: number;
+    startClientY: number;
+    startBox: LayoutBox & { align: BoxAlign };
+  } | null>(null);
+
+  useEffect(() => {
+    const interaction = activeInteraction;
+    if (!interaction) return undefined;
+
+    function handlePointerMove(event: PointerEvent) {
+      if (!interaction) return;
+
+      const previewElement = previewRef.current;
+      if (!previewElement) return;
+
+      const bounds = previewElement.getBoundingClientRect();
+      if (!bounds.width || !bounds.height) return;
+
+      const deltaXPercent = ((event.clientX - interaction.startClientX) / bounds.width) * 100;
+      const deltaYPercent = ((event.clientY - interaction.startClientY) / bounds.height) * 100;
+      const nextBox = adjustBoxFromInteraction(
+        interaction.startBox,
+        interaction.mode,
+        deltaXPercent,
+        deltaYPercent
+      );
+
+      onBoxChange(interaction.boxKey, nextBox);
+    }
+
+    function handlePointerUp() {
+      setActiveInteraction(null);
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [activeInteraction, onBoxChange]);
+
+  function startInteraction(
+    event: React.PointerEvent<HTMLDivElement>,
+    boxKey: SlideBoxKey,
+    mode: BoxInteractionMode
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    setActiveInteraction({
+      boxKey,
+      mode,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startBox: layout[boxKey],
+    });
+  }
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
+      <div className="flex items-center justify-between border-b border-white/10 bg-slate-950/80 px-4 py-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Live editor preview</p>
+          <p className="text-sm text-slate-300">Slide {index + 1} export canvas</p>
+        </div>
+        <span
+          className={`rounded-full px-3 py-1 text-xs font-medium ${
+            approved ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300"
+          }`}
+        >
+          {approved ? "Approved" : "Needs review"}
+        </span>
+      </div>
+      <div className="p-4">
+        <div className="mb-3 flex items-center justify-between text-xs text-slate-400">
+          <span>Drag a box to move it. Use the corner handles to resize it.</span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[11px] uppercase tracking-[0.18em] text-slate-300">
+            16:9 canvas
+          </span>
+        </div>
+        <div
+          ref={previewRef}
+          className="relative overflow-hidden rounded-xl bg-black touch-none"
+          style={{ aspectRatio: "16/9" }}
+        >
+          {templateImageDataUrl && (
+            <Image
+              src={templateImageDataUrl}
+              alt="Slide template background"
+              fill
+              unoptimized
+              className="object-cover"
+            />
+          )}
+          <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.08)_1px,transparent_1px)] bg-[size:10%_10%]" />
+          {showTitle && (
+            <PreviewTextBox
+              box={layout.titleBox}
+              label="Title"
+              color={layout.textColor}
+              emphasis
+              active={activeInteraction?.boxKey === "titleBox"}
+              onInteractStart={(event, mode) => startInteraction(event, "titleBox", mode)}
+            >
+              <span
+                className="whitespace-pre-line font-bold leading-snug"
+                style={{ fontSize: `${Math.max(18, Math.round(layout.titleFontSize / 2.5))}px` }}
+              >
+                {slide.title || "Title preview"}
+              </span>
+            </PreviewTextBox>
+          )}
+          {showBody && (
+            <PreviewTextBox
+              box={layout.bodyBox}
+              label="Body"
+              color={layout.textColor}
+              active={activeInteraction?.boxKey === "bodyBox"}
+              onInteractStart={(event, mode) => startInteraction(event, "bodyBox", mode)}
+            >
+              <span
+                className="whitespace-pre-line leading-relaxed"
+                style={{ fontSize: `${Math.max(16, Math.round(layout.bodyFontSize / 2.7))}px` }}
+              >
+                {slide.body || "Body preview"}
+              </span>
+            </PreviewTextBox>
+          )}
+          {!showTitle && !showBody && (
+            <div className="absolute inset-x-6 top-6 rounded-xl border border-dashed border-white/20 bg-black/35 px-4 py-3 text-sm text-slate-300">
+              This slide has no active text boxes. Re-enable title or body from the editor to place text.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewTextBox({
+  box,
+  label,
+  color,
+  active,
+  emphasis = false,
+  onInteractStart,
+  children,
+}: {
+  box: { x: number; y: number; width: number; height: number; align: BoxAlign };
+  label: string;
+  color: string;
+  active: boolean;
+  emphasis?: boolean;
+  onInteractStart: (
+    event: React.PointerEvent<HTMLDivElement>,
+    mode: BoxInteractionMode
+  ) => void;
+  children: React.ReactNode;
+}) {
+  const handleClassName =
+    "absolute h-3.5 w-3.5 rounded-full border border-white/80 bg-slate-950 shadow-[0_0_0_2px_rgba(15,23,42,0.65)]";
+
+  return (
+    <div
+      className={`absolute overflow-hidden rounded-lg border-2 px-3 py-2 transition ${
+        emphasis ? "border-cyan-300/90 bg-cyan-300/10" : "border-amber-300/80 bg-amber-300/10"
+      } ${active ? "ring-4 ring-white/15" : ""}`}
+      onPointerDown={(event) => onInteractStart(event, "move")}
+      role="presentation"
+      style={{
+        left: `${box.x}%`,
+        top: `${box.y}%`,
+        width: `${box.width}%`,
+        height: `${box.height}%`,
+        color,
+        textAlign: box.align,
+        cursor: active ? "grabbing" : "grab",
+        userSelect: "none",
+      }}
+    >
+      <div
+        className={`${handleClassName} left-0 top-0 -translate-x-1/2 -translate-y-1/2 cursor-nwse-resize`}
+        onPointerDown={(event) => onInteractStart(event, "resize-nw")}
+      />
+      <div
+        className={`${handleClassName} right-0 top-0 translate-x-1/2 -translate-y-1/2 cursor-nesw-resize`}
+        onPointerDown={(event) => onInteractStart(event, "resize-ne")}
+      />
+      <div
+        className={`${handleClassName} bottom-0 left-0 -translate-x-1/2 translate-y-1/2 cursor-nesw-resize`}
+        onPointerDown={(event) => onInteractStart(event, "resize-sw")}
+      />
+      <div
+        className={`${handleClassName} bottom-0 right-0 translate-x-1/2 translate-y-1/2 cursor-nwse-resize`}
+        onPointerDown={(event) => onInteractStart(event, "resize-se")}
+      />
+      <span className="absolute right-2 top-2 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+        {label}
+      </span>
+      <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-200">
+        Drag
+      </span>
+      <div className="h-full overflow-hidden pt-8">{children}</div>
+    </div>
+  );
+}
+
+function LayoutBoxEditor({
+  title,
+  enabled,
+  hasContent,
+  box,
+  toggleLabel,
+  onToggle,
+  onFieldChange,
+}: {
+  title: string;
+  enabled: boolean;
+  hasContent: boolean;
+  box: { x: number; y: number; width: number; height: number; align: BoxAlign };
+  toggleLabel: string;
+  onToggle: () => void;
+  onFieldChange: (field: keyof LayoutBox, value: string) => void;
+}) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm font-medium text-white">{title}</p>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Percent</span>
+          <button
+            type="button"
+            disabled={!hasContent}
+            onClick={onToggle}
+            className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {toggleLabel}
+          </button>
+        </div>
+      </div>
+      {!hasContent && (
+        <p className="mt-3 text-xs text-slate-500">No text was generated for this section on this slide.</p>
+      )}
+      {hasContent && !enabled && (
+        <p className="mt-3 text-xs text-slate-400">This text box is currently removed from preview and export. Use the button above to restore it.</p>
+      )}
+      {hasContent && enabled && (
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <NumericLayoutField label="X" value={box.x} min={0} max={100} onChange={(value) => onFieldChange("x", value)} />
+          <NumericLayoutField label="Y" value={box.y} min={0} max={100} onChange={(value) => onFieldChange("y", value)} />
+          <NumericLayoutField label="Width" value={box.width} min={5} max={100} onChange={(value) => onFieldChange("width", value)} />
+          <NumericLayoutField label="Height" value={box.height} min={5} max={100} onChange={(value) => onFieldChange("height", value)} />
+          <label className="col-span-2 text-xs text-slate-400">
+            Alignment
+            <select
+              value={box.align}
+              onChange={(e) => onFieldChange("align", e.target.value)}
+              className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
+            >
+              <option value="left">Left</option>
+              <option value="center">Center</option>
+              <option value="right">Right</option>
+            </select>
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NumericLayoutField({
+  label,
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="text-xs text-slate-400">
+      {label}
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step="0.1"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
+      />
+    </label>
   );
 }
 
