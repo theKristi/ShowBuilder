@@ -360,6 +360,45 @@ function trimForPrompt(value: string, maxChars: number): string {
   return `${trimmed.slice(0, maxChars)}\n\n[Truncated for model input limits]`;
 }
 
+const CANVAS_W = 1920;
+const CANVAS_H = 1080;
+const TITLE_FONT_SIZE = 60;
+const BODY_FONT_SIZE = 40;
+
+function estimateCharLimit(widthPct: number, heightPct: number, fontSize: number): number {
+  const avgCharWidth = fontSize * 0.55;
+  const lineHeight = fontSize * 1.3;
+  const charsPerLine = Math.floor((widthPct / 100) * CANVAS_W / avgCharWidth);
+  const lines = Math.floor((heightPct / 100) * CANVAS_H / lineHeight);
+  return Math.max(1, charsPerLine * Math.max(1, lines));
+}
+
+function buildZoneGuidance(zones: TemplateZones | undefined, label: string): string {
+  if (!zones?.title && !zones?.body) return "";
+
+  const lines: string[] = [`${label} text zone constraints (slide is ${CANVAS_W}×${CANVAS_H}px):`];
+
+  if (zones.title) {
+    const limit = estimateCharLimit(zones.title.width, zones.title.height, TITLE_FONT_SIZE);
+    lines.push(
+      `- Title box: ${zones.title.width}% wide × ${zones.title.height}% tall at ${TITLE_FONT_SIZE}pt → keep title under ${limit} characters (~${Math.ceil(limit / 5)} words)`
+    );
+  } else {
+    lines.push("- No title zone defined — leave title empty.");
+  }
+
+  if (zones.body) {
+    const limit = estimateCharLimit(zones.body.width, zones.body.height, BODY_FONT_SIZE);
+    lines.push(
+      `- Body box: ${zones.body.width}% wide × ${zones.body.height}% tall at ${BODY_FONT_SIZE}pt → keep body under ${limit} characters`
+    );
+  } else {
+    lines.push("- No body zone defined — leave body empty.");
+  }
+
+  return lines.join("\n");
+}
+
 type AnthropicContentBlock = Anthropic.TextBlockParam | Anthropic.ImageBlockParam;
 
 function parseImageDataUrl(
@@ -423,6 +462,12 @@ Template rules:
         ? "\n\nTemplate images were omitted for this request because they exceed model input-size limits."
         : "";
 
+    const pointZoneGuidance = buildZoneGuidance(req.zoneMap?.[0], "Point slide");
+    const scriptureZoneGuidance = buildZoneGuidance(req.zoneMap?.[1], "Scripture slide");
+    const zoneGuidanceSection = [pointZoneGuidance, scriptureZoneGuidance]
+      .filter(Boolean)
+      .join("\n\n");
+
     const userMessage = `Presentation Title: ${req.presentationTitle}
 
 Batch ${processedBatchCount + 1}
@@ -438,7 +483,7 @@ Content Constraints:
 - Use only text that appears in the Structured Note Segments listed below.
 - Do not introduce any new wording beyond those segments.
 - Keep each slide tied to its primary segment text.
-
+${zoneGuidanceSection ? `\n${zoneGuidanceSection}\n- Text MUST fit within the character limits above — trim or split the segment if needed to stay within bounds.` : ""}
 Structured Note Segments (ordered):
 ${segmentListText}
 
@@ -559,8 +604,8 @@ If template slide images are provided, use them as visual references for layout,
         titleBox,
         bodyBox,
         textColor: "#FFFFFF",
-        titleFontSize: 60,
-        bodyFontSize: 40,
+        titleFontSize: TITLE_FONT_SIZE,
+        bodyFontSize: BODY_FONT_SIZE,
       },
     };
   });
