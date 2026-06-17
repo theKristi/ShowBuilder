@@ -11,7 +11,7 @@
   "dependencies": {
     "jszip": "^3.10.1",
     "next": "16.1.6",
-    "openai": "^6.23.0",
+    "@anthropic-ai/sdk": "^0.55.0",
     "pdf-parse": "^1.1.1",
     "protobufjs": "^8.0.3",
     "react": "19.2.3",

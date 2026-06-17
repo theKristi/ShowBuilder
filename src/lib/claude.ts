@@ -1,22 +1,33 @@
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 
-let client: OpenAI | null = null;
+let client: Anthropic | null = null;
 
-export function getOpenAIClient(): OpenAI {
+export function getAnthropicClient(): Anthropic {
   if (!client) {
-    const apiKey = process.env.GITHUB_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
       throw new Error(
-        "GITHUB_TOKEN environment variable is not set. Please add it to your .env.local file."
+        "ANTHROPIC_API_KEY environment variable is not set. Please add it to your .env.local file."
       );
     }
-    client = new OpenAI({
-      apiKey,
-      baseURL: "https://models.inference.ai.azure.com",
-    });
+    client = new Anthropic({ apiKey });
   }
   return client;
 }
+
+export interface ZoneBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export type TemplateZones = {
+  title?: ZoneBox;
+  body?: ZoneBox;
+};
+
+export type ZoneMap = Record<number, TemplateZones>;
 
 export interface GeneratedSlide {
   title: string;
@@ -49,6 +60,12 @@ export interface GenerateRequest {
   presentationNotes: string;
   presentationTitle: string;
   templateSlideImageDataUrls?: string[];
+  zoneMap?: ZoneMap;
+}
+
+export interface GenerateResult {
+  slides: GeneratedSlide[];
+  fallbackTypes: string[];
 }
 
 const STYLE_GUIDE_OCR_SYSTEM_PROMPT = `You are an OCR assistant.
@@ -61,19 +78,12 @@ Rules:
 - Return plain text only`;
 
 const SLIDE_GENERATION_MODEL =
-  process.env.OPENAI_GENERATE_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
-const STYLE_GUIDE_OCR_MODEL = process.env.OPENAI_OCR_MODEL ?? "gpt-4.1-mini";
+  process.env.ANTHROPIC_GENERATE_MODEL ?? "claude-sonnet-4-6";
+const STYLE_GUIDE_OCR_MODEL =
+  process.env.ANTHROPIC_OCR_MODEL ?? "claude-haiku-4-5-20251001";
 const MAX_SEGMENT_BATCH_CHARS = 5500;
 const MAX_STYLE_GUIDE_PROMPT_CHARS = 2500;
 const MAX_TEMPLATE_IMAGE_PAYLOAD_CHARS = 120000;
-
-function assertSupportedGitHubModel(model: string, settingName: string): void {
-  if (/claude|anthropic/i.test(model)) {
-    throw new Error(
-      `${settingName} is set to \"${model}\", but Anthropic Claude models are not available for the current GitHub Models token/provider. Use an available model such as \"gpt-4.1-mini\".`
-    );
-  }
-}
 
 const SYSTEM_PROMPT = `You are an expert presentation designer for ProPresenter, a live presentation software used in churches and live events.
 
@@ -96,17 +106,7 @@ Rules:
   - "point": teaching points, takeaways, application statements
   - "scripture": bible/book references or verse content
   - "other": everything else
-- Provide a layout object for each slide with percentage-based text boxes so text can be positioned on top of template rectangles
-- Coordinates must be in percentages from 0 to 100
-- Keep text boxes inside slide bounds
-- If template rectangles are visible, place titleBox/bodyBox to match those rectangles
-- If no clear rectangle exists, use a readable default centered region
-- For single-text designs, prioritize one main text box and leave the unused text field empty
-- Include align for titleBox/bodyBox when relevant
-- Provide titleFontSize and bodyFontSize in the layout, using the style guide or template as a reference for relative sizing between title and body
-- Use the Gotham bold font for titles and Gotham book for all text
-- Return output as valid json only, as a single object with this exact top-level shape: {"slides": [...]}.
-}`;
+- Return output as valid JSON only, as a single object with this exact shape: {"slides": [{"title": "string", "body": "string", "notes": "string", "slideType": "point|scripture|other"}]}`;
 
 interface NoteSegment {
   text: string;
@@ -225,7 +225,7 @@ function extractNoteSegments(notes: string): NoteSegment[] {
 
 function buildSlideTitleFromSegment(text: string): string {
   const words = compactWhitespace(text)
-    .replace(/["'“”‘’()\[\]{}]/g, "")
+    .replace(/["'""''()\[\]{}]/g, "")
     .split(" ")
     .filter(Boolean)
     .slice(0, 5);
@@ -316,7 +316,13 @@ function partitionNoteSegments(segments: NoteSegment[], maxCharsPerBatch: number
 function isPayloadTooLargeError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const message = err.message.toLowerCase();
-  return message.includes("413") || message.includes("request body too large") || message.includes("max size");
+  return (
+    message.includes("413") ||
+    message.includes("request body too large") ||
+    message.includes("request too large") ||
+    message.includes("request entity too large") ||
+    message.includes("max size")
+  );
 }
 
 function isUnexpectedEndOfJsonError(err: unknown): boolean {
@@ -354,10 +360,20 @@ function trimForPrompt(value: string, maxChars: number): string {
   return `${trimmed.slice(0, maxChars)}\n\n[Truncated for model input limits]`;
 }
 
-export async function generateSlides(req: GenerateRequest): Promise<GeneratedSlide[]> {
-  assertSupportedGitHubModel(SLIDE_GENERATION_MODEL, "OPENAI_GENERATE_MODEL");
+type AnthropicContentBlock = Anthropic.TextBlockParam | Anthropic.ImageBlockParam;
 
-  const openai = getOpenAIClient();
+function parseImageDataUrl(
+  dataUrl: string
+): { mediaType: "image/png" | "image/jpeg" | "image/webp"; data: string } | null {
+  const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return null;
+  const rawType = match[1].toLowerCase();
+  const mediaType = rawType === "image/jpg" ? "image/jpeg" : (rawType as "image/png" | "image/jpeg" | "image/webp");
+  return { mediaType, data: match[2] };
+}
+
+export async function generateSlides(req: GenerateRequest): Promise<GenerateResult> {
+  const anthropic = getAnthropicClient();
   const noteSegments = extractNoteSegments(req.presentationNotes);
   if (noteSegments.length === 0) {
     throw new Error(
@@ -428,13 +444,18 @@ ${segmentListText}
 
 If template slide images are provided, use them as visual references for layout, spacing, typography hierarchy, and visual tone while preserving the provided content.${templateRules}${templateSizeNote}`;
 
-    const buildUserContent = (includeTemplates: boolean): Array<OpenAI.Chat.Completions.ChatCompletionContentPart> => {
-      const content: Array<OpenAI.Chat.Completions.ChatCompletionContentPart> = [{ type: "text", text: userMessage }];
+    const buildUserContent = (includeTemplates: boolean): AnthropicContentBlock[] => {
+      const content: AnthropicContentBlock[] = [{ type: "text", text: userMessage }];
 
       if (includeTemplates) {
         templateImagesForModel.forEach((imageDataUrl, index) => {
+          const parsed = parseImageDataUrl(imageDataUrl);
+          if (!parsed) return;
           content.push({ type: "text", text: `Template slide ${index + 1}:` });
-          content.push({ type: "image_url", image_url: { url: imageDataUrl } });
+          content.push({
+            type: "image",
+            source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+          });
         });
       }
 
@@ -442,15 +463,12 @@ If template slide images are provided, use them as visual references for layout,
     };
 
     const runRequest = async (includeTemplates: boolean) =>
-      openai.chat.completions.create({
+      anthropic.messages.create({
         model: SLIDE_GENERATION_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: buildUserContent(includeTemplates) },
-        ],
+        system: systemPrompt,
+        messages: [{ role: "user", content: buildUserContent(includeTemplates) }],
         temperature: 0.7,
         max_tokens: 4096,
-        response_format: { type: "json_object" },
       });
 
     let response: Awaited<ReturnType<typeof runRequest>>;
@@ -470,9 +488,9 @@ If template slide images are provided, use them as visual references for layout,
       }
     }
 
-    const content = response.choices[0]?.message?.content;
+    const content = response.content[0]?.type === "text" ? response.content[0].text : null;
     if (!content) {
-      throw new Error("No response received from OpenAI.");
+      throw new Error("No response received from Anthropic.");
     }
 
     let parsedSlides: GeneratedSlide[];
@@ -501,35 +519,16 @@ If template slide images are provided, use them as visual references for layout,
 
   const constrainedSlides = enforceSlideCountFromNotes(batchSlides, noteSegments, targetSlideCount);
 
+  const fallbackTypes = new Set<string>();
+
   const normalizedSlides = constrainedSlides.map((slide) => {
     const normalizedType =
       slide.slideType === "point" || slide.slideType === "scripture" || slide.slideType === "other"
         ? slide.slideType
         : "other";
 
-    const titleBox = slide.layout?.titleBox;
-    const bodyBox = slide.layout?.bodyBox;
-
-    const normalizePercent = (value: unknown, fallback: number): number => {
-      const n = typeof value === "number" ? value : Number(value);
-      if (!Number.isFinite(n)) return fallback;
-      return Math.max(0, Math.min(100, n));
-    };
-
-    const normalizeBox = (
-      box: typeof titleBox,
-      fallback: { x: number; y: number; width: number; height: number; align: "left" | "center" | "right" }
-    ) => {
-      if (!box) return fallback;
-      const x = normalizePercent(box.x, fallback.x);
-      const y = normalizePercent(box.y, fallback.y);
-      const width = normalizePercent(box.width, fallback.width);
-      const height = normalizePercent(box.height, fallback.height);
-      const align = box.align === "left" || box.align === "center" || box.align === "right"
-        ? box.align
-        : fallback.align;
-      return { x, y, width, height, align };
-    };
+    const templateIndex = normalizedType === "scripture" ? 1 : 0;
+    const zones = req.zoneMap?.[templateIndex];
 
     const defaultLayout = normalizedType === "scripture"
       ? {
@@ -541,27 +540,32 @@ If template slide images are provided, use them as visual references for layout,
           bodyBox: { x: 10, y: 28, width: 80, height: 54, align: "left" as const },
         };
 
-    const titleFontSize = typeof slide.layout?.titleFontSize === "number"
-      ? Math.max(20, Math.min(140, slide.layout.titleFontSize))
-      : 60;
-    const bodyFontSize = typeof slide.layout?.bodyFontSize === "number"
-      ? Math.max(16, Math.min(110, slide.layout.bodyFontSize))
-      : 40;
+    const titleBox = zones?.title
+      ? { ...zones.title, align: defaultLayout.titleBox.align }
+      : defaultLayout.titleBox;
+
+    const bodyBox = zones?.body
+      ? { ...zones.body, align: defaultLayout.bodyBox.align }
+      : defaultLayout.bodyBox;
+
+    if (!zones?.title && !zones?.body) {
+      fallbackTypes.add(normalizedType);
+    }
 
     return {
       ...slide,
       slideType: normalizedType,
       layout: {
-        titleBox: normalizeBox(titleBox, defaultLayout.titleBox),
-        bodyBox: normalizeBox(bodyBox, defaultLayout.bodyBox),
-        textColor: slide.layout?.textColor ?? "#FFFFFF",
-        titleFontSize,
-        bodyFontSize,
+        titleBox,
+        bodyBox,
+        textColor: "#FFFFFF",
+        titleFontSize: 60,
+        bodyFontSize: 40,
       },
     };
   });
 
-  return normalizedSlides;
+  return { slides: normalizedSlides, fallbackTypes: [...fallbackTypes] };
 }
 
 export async function extractStyleGuideTextFromImage(imageDataUrl: string): Promise<string> {
@@ -569,27 +573,33 @@ export async function extractStyleGuideTextFromImage(imageDataUrl: string): Prom
     throw new Error("Unsupported style guide image format. Please use PNG, JPG, or WebP.");
   }
 
-  assertSupportedGitHubModel(STYLE_GUIDE_OCR_MODEL, "OPENAI_OCR_MODEL");
+  const parsed = parseImageDataUrl(imageDataUrl);
+  if (!parsed) {
+    throw new Error("Could not parse style guide image data URL.");
+  }
 
-  const openai = getOpenAIClient();
+  const anthropic = getAnthropicClient();
 
-  const response = await openai.chat.completions.create({
+  const response = await anthropic.messages.create({
     model: STYLE_GUIDE_OCR_MODEL,
-    temperature: 0,
-    max_tokens: 1200,
+    system: STYLE_GUIDE_OCR_SYSTEM_PROMPT,
     messages: [
-      { role: "system", content: STYLE_GUIDE_OCR_SYSTEM_PROMPT },
       {
         role: "user",
         content: [
           { type: "text", text: "Extract the style guide text from this image." },
-          { type: "image_url", image_url: { url: imageDataUrl } },
+          {
+            type: "image",
+            source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+          },
         ],
       },
     ],
+    temperature: 0,
+    max_tokens: 1200,
   });
 
-  const extractedText = response.choices[0]?.message?.content?.trim();
+  const extractedText = response.content[0]?.type === "text" ? response.content[0].text.trim() : null;
   if (!extractedText) {
     throw new Error("Could not read text from style guide image.");
   }

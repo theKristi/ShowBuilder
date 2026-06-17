@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { extractStyleGuideTextFromImage, generateSlides } from "@/lib/openai";
+import { extractStyleGuideTextFromImage, generateSlides, ZoneMap } from "@/lib/claude";
 import { parsePresentationNotesFile } from "@/lib/document-parser";
 
 export async function POST(req: NextRequest) {
@@ -12,6 +12,7 @@ export async function POST(req: NextRequest) {
       presentationNotes,
       presentationNotesFileDataUrl,
       presentationTitle,
+      zoneMap,
     } = body as {
       styleGuide: string;
       styleGuideImageDataUrl?: string;
@@ -19,6 +20,7 @@ export async function POST(req: NextRequest) {
       presentationNotes: string;
       presentationNotesFileDataUrl?: string;
       presentationTitle: string;
+      zoneMap?: ZoneMap;
     };
 
     const resolvedTemplateSlideImages = (templateSlideImageDataUrls ?? []).filter((url) =>
@@ -55,17 +57,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const slides = await generateSlides({
+    const { slides, fallbackTypes } = await generateSlides({
       styleGuide: resolvedStyleGuide,
       presentationNotes: resolvedPresentationNotes,
       presentationTitle,
       templateSlideImageDataUrls: resolvedTemplateSlideImages,
+      zoneMap,
     });
 
-    return NextResponse.json({ slides });
+    return NextResponse.json({ slides, fallbackTypes });
   } catch (err) {
     const message = err instanceof Error ? err.message : "An unexpected error occurred.";
-    const status = message.includes("GITHUB_TOKEN") ? 503 : 500;
+    const status = message.includes("ANTHROPIC_API_KEY") ? 503 : 500;
     return NextResponse.json({ error: message }, { status });
   }
 }

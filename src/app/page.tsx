@@ -30,7 +30,20 @@ interface ResolvedSlideLayout {
 }
 
 type SlideBoxKey = "titleBox" | "bodyBox";
-type BoxInteractionMode = "move" | "resize-nw" | "resize-ne" | "resize-sw" | "resize-se";
+
+interface ZoneBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+type TemplateZones = {
+  title?: ZoneBox;
+  body?: ZoneBox;
+};
+
+type ZoneMap = Record<number, TemplateZones>;
 
 interface Slide {
   title: string;
@@ -45,6 +58,7 @@ interface Slide {
 interface GenerateResponse {
   slides?: Slide[];
   error?: string;
+  fallbackTypes?: string[];
 }
 
 function resolveTemplateIndexForSlide(slide: Slide, templateCount: number): number {
@@ -98,67 +112,6 @@ function buildEditableLayout(layout?: SlideLayout): ResolvedSlideLayout {
   };
 }
 
-function adjustBoxFromInteraction(
-  box: LayoutBox & { align: BoxAlign },
-  mode: BoxInteractionMode,
-  deltaXPercent: number,
-  deltaYPercent: number
-): LayoutBox & { align: BoxAlign } {
-  const minWidth = 5;
-  const minHeight = 5;
-  const startRight = box.x + box.width;
-  const startBottom = box.y + box.height;
-
-  if (mode === "move") {
-    return {
-      ...box,
-      x: roundPercent(clamp(box.x + deltaXPercent, 0, 100 - box.width)),
-      y: roundPercent(clamp(box.y + deltaYPercent, 0, 100 - box.height)),
-    };
-  }
-
-  if (mode === "resize-nw") {
-    const x = roundPercent(clamp(box.x + deltaXPercent, 0, startRight - minWidth));
-    const y = roundPercent(clamp(box.y + deltaYPercent, 0, startBottom - minHeight));
-    return {
-      ...box,
-      x,
-      y,
-      width: roundPercent(startRight - x),
-      height: roundPercent(startBottom - y),
-    };
-  }
-
-  if (mode === "resize-ne") {
-    const right = roundPercent(clamp(startRight + deltaXPercent, box.x + minWidth, 100));
-    const y = roundPercent(clamp(box.y + deltaYPercent, 0, startBottom - minHeight));
-    return {
-      ...box,
-      y,
-      width: roundPercent(right - box.x),
-      height: roundPercent(startBottom - y),
-    };
-  }
-
-  if (mode === "resize-sw") {
-    const x = roundPercent(clamp(box.x + deltaXPercent, 0, startRight - minWidth));
-    const bottom = roundPercent(clamp(startBottom + deltaYPercent, box.y + minHeight, 100));
-    return {
-      ...box,
-      x,
-      width: roundPercent(startRight - x),
-      height: roundPercent(bottom - box.y),
-    };
-  }
-
-  const right = roundPercent(clamp(startRight + deltaXPercent, box.x + minWidth, 100));
-  const bottom = roundPercent(clamp(startBottom + deltaYPercent, box.y + minHeight, 100));
-  return {
-    ...box,
-    width: roundPercent(right - box.x),
-    height: roundPercent(bottom - box.y),
-  };
-}
 
 function getSlideLayout(slide: Slide): ResolvedSlideLayout {
   return buildEditableLayout(slide.layout);
@@ -190,8 +143,10 @@ export default function Home() {
   const [presentationNotes, setPresentationNotes] = useState("");
   const [presentationNotesFileDataUrl, setPresentationNotesFileDataUrl] = useState<string | null>(null);
   const [presentationNotesFileName, setPresentationNotesFileName] = useState<string | null>(null);
+  const [zoneMap, setZoneMap] = useState<ZoneMap>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fallbackWarning, setFallbackWarning] = useState<string | null>(null);
   const [slides, setSlides] = useState<Slide[] | null>(null);
   const [selectedSlideIndex, setSelectedSlideIndex] = useState(0);
   const [approvedSlides, setApprovedSlides] = useState<boolean[]>([]);
@@ -300,6 +255,7 @@ export default function Home() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setFallbackWarning(null);
     setSlides(null);
     setLoading(true);
 
@@ -314,6 +270,7 @@ export default function Home() {
           templateSlideImageDataUrls,
           presentationNotes,
           presentationNotesFileDataUrl,
+          zoneMap,
         }),
       });
       const data: GenerateResponse = await res.json();
@@ -329,6 +286,11 @@ export default function Home() {
         setSlides(nextSlides);
         setSelectedSlideIndex(0);
         setApprovedSlides(nextSlides.map(() => false));
+        if (data.fallbackTypes && data.fallbackTypes.length > 0) {
+          setFallbackWarning(
+            `No zones were defined for: ${data.fallbackTypes.join(", ")} slides. Default layout was used. Define zones on your templates before generating for accurate placement.`
+          );
+        }
       }
     } catch {
       setError("Network error. Please try again.");
@@ -529,31 +491,7 @@ export default function Home() {
     );
   }
 
-  function updateSlideBox(
-    index: number,
-    boxKey: "titleBox" | "bodyBox",
-    field: keyof LayoutBox,
-    rawValue: string
-  ) {
-    const parsedValue = field === "align" ? rawValue : Number(rawValue);
-    if (field !== "align" && Number.isNaN(parsedValue)) return;
-
-    const currentSlide = slides?.[index];
-    if (!currentSlide) return;
-
-    const currentLayout = getSlideLayout(currentSlide);
-    const nextBox: LayoutBox = {
-      ...currentLayout[boxKey],
-      [field]: parsedValue,
-    } as LayoutBox;
-
-    updateSlideLayout(index, {
-      ...currentLayout,
-      [boxKey]: normalizeBox(nextBox, currentLayout[boxKey]),
-    });
-  }
-
-  function updateSlideStyleField(
+function updateSlideStyleField(
     index: number,
     field: "textColor" | "titleFontSize" | "bodyFontSize",
     rawValue: string
@@ -621,41 +559,7 @@ export default function Home() {
     );
   }
 
-  function resetSlideLayout(index: number) {
-    const currentSlide = slides?.[index];
-    if (!currentSlide) return;
-
-    updateSlideLayout(index, buildEditableLayout(undefined));
-  }
-
-  function applyLayoutToMatchingSlides(index: number) {
-    const currentSlide = slides?.[index];
-    if (!slides || !currentSlide) return;
-
-    const sourceLayout = buildEditableLayout(currentSlide.layout);
-    const sourceType = currentSlide.slideType ?? "other";
-
-    setSlides((currentSlides) => {
-      if (!currentSlides) return currentSlides;
-      return currentSlides.map((slide) =>
-        (slide.slideType ?? "other") === sourceType
-          ? {
-              ...slide,
-              layout: sourceLayout,
-            }
-          : slide
-      );
-    });
-
-    setApprovedSlides((currentApprovals) =>
-      currentApprovals.map((approved, slideIndex) => {
-        const slide = slides[slideIndex];
-        return (slide?.slideType ?? "other") === sourceType ? false : approved;
-      })
-    );
-  }
-
-  function approveSlide(index: number) {
+function approveSlide(index: number) {
     setApprovedSlides((currentApprovals) =>
       currentApprovals.map((approved, slideIndex) => (slideIndex === index ? true : approved))
     );
@@ -764,11 +668,10 @@ export default function Home() {
                   />
                 </div>
                 {templateSlideFileNames.length > 0 && (
-                  <div className="space-y-2">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-xs text-slate-500">
-                        Loaded {templateSlideFileNames.length} template slide
-                        {templateSlideFileNames.length === 1 ? "" : "s"}: {templateSlideFileNames.join(", ")}
+                        {templateSlideFileNames.length} template slide{templateSlideFileNames.length === 1 ? "" : "s"} — draw text zones on each
                       </p>
                       <button
                         type="button"
@@ -778,39 +681,38 @@ export default function Home() {
                         Clear all
                       </button>
                     </div>
-                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                      {templateSlideImageDataUrls.map((dataUrl, index) => (
-                        <div
-                          key={`${templateSlideFileNames[index] ?? "template"}-${index}`}
-                          className="relative overflow-hidden rounded-md border border-white/10 bg-black/40"
-                        >
+                    {templateSlideImageDataUrls.map((dataUrl, index) => (
+                      <div
+                        key={`${templateSlideFileNames[index] ?? "template"}-${index}`}
+                        className="rounded-lg border border-white/10 bg-black/30 p-2"
+                      >
+                        <div className="mb-1.5 flex items-center justify-between">
+                          <div>
+                            <p className="text-[10px] font-medium uppercase tracking-wide text-cyan-300/90">
+                              {getTemplateRoleLabel(index)}
+                            </p>
+                            <p className="truncate text-[10px] text-slate-400">
+                              {templateSlideFileNames[index] ?? `Template ${index + 1}`}
+                            </p>
+                          </div>
                           <button
                             type="button"
                             onClick={() => handleRemoveTemplateSlide(index)}
                             aria-label={`Remove template slide ${index + 1}`}
-                            className="absolute right-1.5 top-1.5 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white transition hover:bg-black/90"
+                            className="rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white transition hover:bg-red-600/80"
                           >
                             Remove
                           </button>
-                          <Image
-                            src={dataUrl}
-                            alt={`Template slide ${index + 1}`}
-                            width={240}
-                            height={135}
-                            unoptimized
-                            className="h-20 w-full object-cover"
-                          />
-                          <div className="space-y-0.5 px-2 py-1">
-                            <p className="truncate text-[10px] text-slate-300">
-                              {templateSlideFileNames[index] ?? `Template ${index + 1}`}
-                            </p>
-                            <p className="text-[10px] font-medium uppercase tracking-wide text-cyan-300/90">
-                              {getTemplateRoleLabel(index)}
-                            </p>
-                          </div>
                         </div>
-                      ))}
-                    </div>
+                        <TemplateZoneEditor
+                          imageUrl={dataUrl}
+                          zones={zoneMap[index] ?? {}}
+                          onChange={(zones) =>
+                            setZoneMap((prev) => ({ ...prev, [index]: zones }))
+                          }
+                        />
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -895,6 +797,13 @@ export default function Home() {
           </div>
         )}
 
+        {/* Fallback warning */}
+        {fallbackWarning && (
+          <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300">
+            <strong>Layout warning:</strong> {fallbackWarning}
+          </div>
+        )}
+
         {/* Slide Preview */}
         {slides && slides.length > 0 && (
           <section className="mt-10">
@@ -905,7 +814,7 @@ export default function Home() {
                     Review and approve layout
                   </h2>
                   <p className="text-sm text-cyan-100/80">
-                    Adjust title and body boxes against the template, then approve each slide before exporting.
+                    Review slide content against the template, then approve each slide before exporting.
                   </p>
                 </div>
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -930,13 +839,6 @@ export default function Home() {
                   index={selectedSlideIndex}
                   templateImageDataUrl={resolveTemplateForSlide(selectedSlide, templateSlideImageDataUrls)}
                   approved={approvedSlides[selectedSlideIndex] ?? false}
-                  onBoxChange={(boxKey, nextBox) => {
-                    const currentLayout = getSlideLayout(selectedSlide);
-                    updateSlideLayout(selectedSlideIndex, {
-                      ...currentLayout,
-                      [boxKey]: nextBox,
-                    });
-                  }}
                 />
                 <aside className="rounded-2xl border border-white/10 bg-white/5 p-4">
                   <div className="flex items-start justify-between gap-3">
@@ -963,40 +865,33 @@ export default function Home() {
                   </div>
 
                   <div className="mt-4 space-y-4">
-                    <LayoutBoxEditor
-                      title="Title box"
-                      enabled={isSlideTextVisible(selectedSlide, "title")}
-                      hasContent={hasSlideText(selectedSlide, "title")}
-                      box={getSlideLayout(selectedSlide).titleBox}
-                      toggleLabel={isSlideTextVisible(selectedSlide, "title") ? "Hide title" : "Use title"}
-                      onToggle={() =>
-                        updateSlideVisibility(
-                          selectedSlideIndex,
-                          "title",
-                          !isSlideTextVisible(selectedSlide, "title")
-                        )
-                      }
-                      onFieldChange={(field, value) =>
-                        updateSlideBox(selectedSlideIndex, "titleBox", field, value)
-                      }
-                    />
-                    <LayoutBoxEditor
-                      title="Body box"
-                      enabled={isSlideTextVisible(selectedSlide, "body")}
-                      hasContent={hasSlideText(selectedSlide, "body")}
-                      box={getSlideLayout(selectedSlide).bodyBox}
-                      toggleLabel={isSlideTextVisible(selectedSlide, "body") ? "Hide body" : "Use body"}
-                      onToggle={() =>
-                        updateSlideVisibility(
-                          selectedSlideIndex,
-                          "body",
-                          !isSlideTextVisible(selectedSlide, "body")
-                        )
-                      }
-                      onFieldChange={(field, value) =>
-                        updateSlideBox(selectedSlideIndex, "bodyBox", field, value)
-                      }
-                    />
+                    <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                      <p className="text-sm font-medium text-white">Visibility</p>
+                      <div className="mt-2 flex gap-2">
+                        {hasSlideText(selectedSlide, "title") && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateSlideVisibility(selectedSlideIndex, "title", !isSlideTextVisible(selectedSlide, "title"))
+                            }
+                            className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/10"
+                          >
+                            {isSlideTextVisible(selectedSlide, "title") ? "Hide title" : "Show title"}
+                          </button>
+                        )}
+                        {hasSlideText(selectedSlide, "body") && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateSlideVisibility(selectedSlideIndex, "body", !isSlideTextVisible(selectedSlide, "body"))
+                            }
+                            className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/10"
+                          >
+                            {isSlideTextVisible(selectedSlide, "body") ? "Hide body" : "Show body"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
 
                     <div className="rounded-xl border border-white/10 bg-black/20 p-3">
                       <div className="flex items-center justify-between gap-3">
@@ -1101,27 +996,13 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+                  <div className="mt-4">
                     <button
                       type="button"
                       onClick={() => approveSlide(selectedSlideIndex)}
-                      className="rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400"
+                      className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400"
                     >
                       Approve this slide
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyLayoutToMatchingSlides(selectedSlideIndex)}
-                      className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/10"
-                    >
-                      Apply to all {(selectedSlide.slideType ?? "other")} slides
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => resetSlideLayout(selectedSlideIndex)}
-                      className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/10"
-                    >
-                      Reset to default layout
                     </button>
                   </div>
                 </aside>
@@ -1271,88 +1152,23 @@ function LayoutEditorPreview({
   slide,
   index,
   approved,
-  onBoxChange,
   templateImageDataUrl,
 }: {
   slide: Slide;
   index: number;
   approved: boolean;
-  onBoxChange: (boxKey: SlideBoxKey, nextBox: LayoutBox & { align: BoxAlign }) => void;
   templateImageDataUrl: string | null;
 }) {
   const layout = getSlideLayout(slide);
   const showTitle = isSlideTextVisible(slide, "title");
   const showBody = isSlideTextVisible(slide, "body");
-  const previewRef = useRef<HTMLDivElement>(null);
-  const [activeInteraction, setActiveInteraction] = useState<{
-    boxKey: SlideBoxKey;
-    mode: BoxInteractionMode;
-    startClientX: number;
-    startClientY: number;
-    startBox: LayoutBox & { align: BoxAlign };
-  } | null>(null);
-
-  useEffect(() => {
-    const interaction = activeInteraction;
-    if (!interaction) return undefined;
-
-    function handlePointerMove(event: PointerEvent) {
-      if (!interaction) return;
-
-      const previewElement = previewRef.current;
-      if (!previewElement) return;
-
-      const bounds = previewElement.getBoundingClientRect();
-      if (!bounds.width || !bounds.height) return;
-
-      const deltaXPercent = ((event.clientX - interaction.startClientX) / bounds.width) * 100;
-      const deltaYPercent = ((event.clientY - interaction.startClientY) / bounds.height) * 100;
-      const nextBox = adjustBoxFromInteraction(
-        interaction.startBox,
-        interaction.mode,
-        deltaXPercent,
-        deltaYPercent
-      );
-
-      onBoxChange(interaction.boxKey, nextBox);
-    }
-
-    function handlePointerUp() {
-      setActiveInteraction(null);
-    }
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-    };
-  }, [activeInteraction, onBoxChange]);
-
-  function startInteraction(
-    event: React.PointerEvent<HTMLDivElement>,
-    boxKey: SlideBoxKey,
-    mode: BoxInteractionMode
-  ) {
-    event.preventDefault();
-    event.stopPropagation();
-
-    setActiveInteraction({
-      boxKey,
-      mode,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startBox: layout[boxKey],
-    });
-  }
 
   return (
     <div className="overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
       <div className="flex items-center justify-between border-b border-white/10 bg-slate-950/80 px-4 py-3">
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Live editor preview</p>
-          <p className="text-sm text-slate-300">Slide {index + 1} export canvas</p>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Slide preview</p>
+          <p className="text-sm text-slate-300">Slide {index + 1} — {(slide.slideType ?? "other")} layout</p>
         </div>
         <span
           className={`rounded-full px-3 py-1 text-xs font-medium ${
@@ -1363,17 +1179,7 @@ function LayoutEditorPreview({
         </span>
       </div>
       <div className="p-4">
-        <div className="mb-3 flex items-center justify-between text-xs text-slate-400">
-          <span>Drag a box to move it. Use the corner handles to resize it.</span>
-          <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[11px] uppercase tracking-[0.18em] text-slate-300">
-            16:9 canvas
-          </span>
-        </div>
-        <div
-          ref={previewRef}
-          className="relative overflow-hidden rounded-xl bg-black touch-none"
-          style={{ aspectRatio: "16/9" }}
-        >
+        <div className="relative overflow-hidden rounded-xl bg-black" style={{ aspectRatio: "16/9" }}>
           {templateImageDataUrl && (
             <Image
               src={templateImageDataUrl}
@@ -1383,43 +1189,49 @@ function LayoutEditorPreview({
               className="object-cover"
             />
           )}
-          <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.08)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.08)_1px,transparent_1px)] bg-[size:10%_10%]" />
           {showTitle && (
-            <PreviewTextBox
-              box={layout.titleBox}
-              label="Title"
-              color={layout.textColor}
-              emphasis
-              active={activeInteraction?.boxKey === "titleBox"}
-              onInteractStart={(event, mode) => startInteraction(event, "titleBox", mode)}
+            <div
+              className="absolute overflow-hidden rounded px-2 py-1"
+              style={{
+                left: `${layout.titleBox.x}%`,
+                top: `${layout.titleBox.y}%`,
+                width: `${layout.titleBox.width}%`,
+                height: `${layout.titleBox.height}%`,
+                color: layout.textColor,
+                textAlign: layout.titleBox.align,
+              }}
             >
               <span
                 className="whitespace-pre-line font-bold leading-snug"
                 style={{ fontSize: `${Math.max(18, Math.round(layout.titleFontSize / 2.5))}px` }}
               >
-                {slide.title || "Title preview"}
+                {slide.title}
               </span>
-            </PreviewTextBox>
+            </div>
           )}
           {showBody && (
-            <PreviewTextBox
-              box={layout.bodyBox}
-              label="Body"
-              color={layout.textColor}
-              active={activeInteraction?.boxKey === "bodyBox"}
-              onInteractStart={(event, mode) => startInteraction(event, "bodyBox", mode)}
+            <div
+              className="absolute overflow-hidden px-2 py-1"
+              style={{
+                left: `${layout.bodyBox.x}%`,
+                top: `${layout.bodyBox.y}%`,
+                width: `${layout.bodyBox.width}%`,
+                height: `${layout.bodyBox.height}%`,
+                color: layout.textColor,
+                textAlign: layout.bodyBox.align,
+              }}
             >
               <span
                 className="whitespace-pre-line leading-relaxed"
                 style={{ fontSize: `${Math.max(16, Math.round(layout.bodyFontSize / 2.7))}px` }}
               >
-                {slide.body || "Body preview"}
+                {slide.body}
               </span>
-            </PreviewTextBox>
+            </div>
           )}
           {!showTitle && !showBody && (
             <div className="absolute inset-x-6 top-6 rounded-xl border border-dashed border-white/20 bg-black/35 px-4 py-3 text-sm text-slate-300">
-              This slide has no active text boxes. Re-enable title or body from the editor to place text.
+              This slide has no active text. Re-enable title or body from the visibility controls.
             </div>
           )}
         </div>
@@ -1428,163 +1240,194 @@ function LayoutEditorPreview({
   );
 }
 
-function PreviewTextBox({
-  box,
-  label,
-  color,
-  active,
-  emphasis = false,
-  onInteractStart,
-  children,
-}: {
-  box: { x: number; y: number; width: number; height: number; align: BoxAlign };
-  label: string;
-  color: string;
-  active: boolean;
-  emphasis?: boolean;
-  onInteractStart: (
-    event: React.PointerEvent<HTMLDivElement>,
-    mode: BoxInteractionMode
-  ) => void;
-  children: React.ReactNode;
-}) {
-  const handleClassName =
-    "absolute h-3.5 w-3.5 rounded-full border border-white/80 bg-slate-950 shadow-[0_0_0_2px_rgba(15,23,42,0.65)]";
-
-  return (
-    <div
-      className={`absolute overflow-hidden rounded-lg border-2 px-3 py-2 transition ${
-        emphasis ? "border-cyan-300/90 bg-cyan-300/10" : "border-amber-300/80 bg-amber-300/10"
-      } ${active ? "ring-4 ring-white/15" : ""}`}
-      onPointerDown={(event) => onInteractStart(event, "move")}
-      role="presentation"
-      style={{
-        left: `${box.x}%`,
-        top: `${box.y}%`,
-        width: `${box.width}%`,
-        height: `${box.height}%`,
-        color,
-        textAlign: box.align,
-        cursor: active ? "grabbing" : "grab",
-        userSelect: "none",
-      }}
-    >
-      <div
-        className={`${handleClassName} left-0 top-0 -translate-x-1/2 -translate-y-1/2 cursor-nwse-resize`}
-        onPointerDown={(event) => onInteractStart(event, "resize-nw")}
-      />
-      <div
-        className={`${handleClassName} right-0 top-0 translate-x-1/2 -translate-y-1/2 cursor-nesw-resize`}
-        onPointerDown={(event) => onInteractStart(event, "resize-ne")}
-      />
-      <div
-        className={`${handleClassName} bottom-0 left-0 -translate-x-1/2 translate-y-1/2 cursor-nesw-resize`}
-        onPointerDown={(event) => onInteractStart(event, "resize-sw")}
-      />
-      <div
-        className={`${handleClassName} bottom-0 right-0 translate-x-1/2 translate-y-1/2 cursor-nwse-resize`}
-        onPointerDown={(event) => onInteractStart(event, "resize-se")}
-      />
-      <span className="absolute right-2 top-2 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
-        {label}
-      </span>
-      <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-200">
-        Drag
-      </span>
-      <div className="h-full overflow-hidden pt-8">{children}</div>
-    </div>
-  );
-}
-
-function LayoutBoxEditor({
-  title,
-  enabled,
-  hasContent,
-  box,
-  toggleLabel,
-  onToggle,
-  onFieldChange,
-}: {
-  title: string;
-  enabled: boolean;
-  hasContent: boolean;
-  box: { x: number; y: number; width: number; height: number; align: BoxAlign };
-  toggleLabel: string;
-  onToggle: () => void;
-  onFieldChange: (field: keyof LayoutBox, value: string) => void;
-}) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-black/20 p-3">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-sm font-medium text-white">{title}</p>
-        <div className="flex items-center gap-2">
-          <span className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Percent</span>
-          <button
-            type="button"
-            disabled={!hasContent}
-            onClick={onToggle}
-            className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {toggleLabel}
-          </button>
-        </div>
-      </div>
-      {!hasContent && (
-        <p className="mt-3 text-xs text-slate-500">No text was generated for this section on this slide.</p>
-      )}
-      {hasContent && !enabled && (
-        <p className="mt-3 text-xs text-slate-400">This text box is currently removed from preview and export. Use the button above to restore it.</p>
-      )}
-      {hasContent && enabled && (
-        <div className="mt-3 grid grid-cols-2 gap-3">
-          <NumericLayoutField label="X" value={box.x} min={0} max={100} onChange={(value) => onFieldChange("x", value)} />
-          <NumericLayoutField label="Y" value={box.y} min={0} max={100} onChange={(value) => onFieldChange("y", value)} />
-          <NumericLayoutField label="Width" value={box.width} min={5} max={100} onChange={(value) => onFieldChange("width", value)} />
-          <NumericLayoutField label="Height" value={box.height} min={5} max={100} onChange={(value) => onFieldChange("height", value)} />
-          <label className="col-span-2 text-xs text-slate-400">
-            Alignment
-            <select
-              value={box.align}
-              onChange={(e) => onFieldChange("align", e.target.value)}
-              className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
-            >
-              <option value="left">Left</option>
-              <option value="center">Center</option>
-              <option value="right">Right</option>
-            </select>
-          </label>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function NumericLayoutField({
-  label,
-  value,
-  min,
-  max,
+function TemplateZoneEditor({
+  imageUrl,
+  zones,
   onChange,
 }: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  onChange: (value: string) => void;
+  imageUrl: string;
+  zones: TemplateZones;
+  onChange: (zones: TemplateZones) => void;
 }) {
+  const [activeZoneType, setActiveZoneType] = useState<"title" | "body">("title");
+  const [drawPreview, setDrawPreview] = useState<{
+    x: number; y: number; width: number; height: number;
+  } | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Refs keep current values accessible inside the window listener (set once on mount)
+  const drawStartRef = useRef<{ x: number; y: number } | null>(null);
+  const activeZoneTypeRef = useRef(activeZoneType);
+  activeZoneTypeRef.current = activeZoneType;
+  const zonesRef = useRef(zones);
+  zonesRef.current = zones;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
+  function getPct(clientX: number, clientY: number) {
+    const b = containerRef.current?.getBoundingClientRect();
+    if (!b) return null;
+    return {
+      x: clamp(((clientX - b.left) / b.width) * 100, 0, 100),
+      y: clamp(((clientY - b.top) / b.height) * 100, 0, 100),
+    };
+  }
+
+  useEffect(() => {
+    function handleMove(e: PointerEvent) {
+      const start = drawStartRef.current;
+      if (!start) return;
+      const pos = getPct(e.clientX, e.clientY);
+      if (!pos) return;
+      setDrawPreview({
+        x: Math.min(start.x, pos.x),
+        y: Math.min(start.y, pos.y),
+        width: Math.abs(pos.x - start.x),
+        height: Math.abs(pos.y - start.y),
+      });
+    }
+
+    function handleUp(e: PointerEvent) {
+      const start = drawStartRef.current;
+      if (!start) return;
+      const pos = getPct(e.clientX, e.clientY);
+      if (pos) {
+        const x = roundPercent(Math.min(start.x, pos.x));
+        const y = roundPercent(Math.min(start.y, pos.y));
+        const width = roundPercent(Math.abs(pos.x - start.x));
+        const height = roundPercent(Math.abs(pos.y - start.y));
+        if (width > 2 && height > 2) {
+          onChangeRef.current({ ...zonesRef.current, [activeZoneTypeRef.current]: { x, y, width, height } });
+        }
+      }
+      drawStartRef.current = null;
+      setDrawPreview(null);
+    }
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+  }, []);
+
+  function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const pos = getPct(e.clientX, e.clientY);
+    if (!pos) return;
+    drawStartRef.current = pos;
+    setDrawPreview({ x: pos.x, y: pos.y, width: 0, height: 0 });
+  }
+
+  const hasNoZones = !zones.title && !zones.body;
+
   return (
-    <label className="text-xs text-slate-400">
-      {label}
-      <input
-        type="number"
-        min={min}
-        max={max}
-        step="0.1"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
-      />
-    </label>
+    <div>
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="text-[10px] uppercase tracking-wide text-slate-500">Draw zone:</span>
+        <button
+          type="button"
+          onClick={() => setActiveZoneType("title")}
+          className={`rounded px-2 py-0.5 text-[11px] font-medium transition ${
+            activeZoneType === "title"
+              ? "bg-cyan-500/30 text-cyan-300 ring-1 ring-cyan-400/50"
+              : "bg-white/5 text-slate-400 hover:bg-white/10"
+          }`}
+        >
+          Title
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveZoneType("body")}
+          className={`rounded px-2 py-0.5 text-[11px] font-medium transition ${
+            activeZoneType === "body"
+              ? "bg-amber-500/30 text-amber-300 ring-1 ring-amber-400/50"
+              : "bg-white/5 text-slate-400 hover:bg-white/10"
+          }`}
+        >
+          Body
+        </button>
+      </div>
+
+      <div
+        ref={containerRef}
+        className="relative select-none overflow-hidden rounded-lg bg-black touch-none"
+        style={{ aspectRatio: "16/9", cursor: drawPreview ? "crosshair" : "crosshair" }}
+        onPointerDown={handlePointerDown}
+      >
+        <Image src={imageUrl} alt="Template" fill unoptimized draggable={false} className="object-cover pointer-events-none" />
+
+        {hasNoZones && !drawPreview && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <span className="rounded-full border border-amber-500/40 bg-amber-500/20 px-3 py-1 text-[11px] font-medium text-amber-300">
+              Zones not set — click and drag to draw
+            </span>
+          </div>
+        )}
+
+        {zones.title && (
+          <div
+            className="absolute border-2 border-cyan-400 bg-cyan-400/15"
+            style={{
+              left: `${zones.title.x}%`,
+              top: `${zones.title.y}%`,
+              width: `${zones.title.width}%`,
+              height: `${zones.title.height}%`,
+            }}
+          >
+            <span className="absolute left-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-bold uppercase tracking-wide text-cyan-300">
+              Title
+            </span>
+            <button
+              type="button"
+              className="absolute right-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-red-600/80"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onChange({ ...zones, title: undefined }); }}
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {zones.body && (
+          <div
+            className="absolute border-2 border-amber-400 bg-amber-400/15"
+            style={{
+              left: `${zones.body.x}%`,
+              top: `${zones.body.y}%`,
+              width: `${zones.body.width}%`,
+              height: `${zones.body.height}%`,
+            }}
+          >
+            <span className="absolute left-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-300">
+              Body
+            </span>
+            <button
+              type="button"
+              className="absolute right-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-bold text-white hover:bg-red-600/80"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onChange({ ...zones, body: undefined }); }}
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {drawPreview && (
+          <div
+            className={`pointer-events-none absolute border-2 ${
+              activeZoneType === "title" ? "border-cyan-400 bg-cyan-400/20" : "border-amber-400 bg-amber-400/20"
+            }`}
+            style={{
+              left: `${drawPreview.x}%`,
+              top: `${drawPreview.y}%`,
+              width: `${drawPreview.width}%`,
+              height: `${drawPreview.height}%`,
+            }}
+          />
+        )}
+      </div>
+    </div>
   );
 }
 
