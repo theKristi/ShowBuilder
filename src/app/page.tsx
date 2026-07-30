@@ -61,6 +61,13 @@ interface GenerateResponse {
   fallbackTypes?: string[];
 }
 
+type WorkflowPhase = "idle" | "style_review" | "notes_clarification" | "generating" | "complete";
+
+interface ChatMessage {
+  role: "user" | "agent";
+  content: string;
+}
+
 function resolveTemplateIndexForSlide(slide: Slide, templateCount: number): number {
   if (templateCount === 0) return -1;
   if (slide.slideType === "scripture" && templateCount > 1) return 1;
@@ -136,14 +143,16 @@ export default function Home() {
   const [presentationTitle, setPresentationTitle] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
   const [styleGuideImageDataUrl, setStyleGuideImageDataUrl] = useState<string | null>(null);
+  const [styleGuideImageDataUrls, setStyleGuideImageDataUrls] = useState<string[]>([]);
   const [styleGuideFileName, setStyleGuideFileName] = useState<string | null>(null);
-  const [styleGuideFileType, setStyleGuideFileType] = useState<"text" | "image" | null>(null);
+  const [styleGuideFileType, setStyleGuideFileType] = useState<"text" | "image" | "pdf" | null>(null);
   const [templateSlideImageDataUrls, setTemplateSlideImageDataUrls] = useState<string[]>([]);
   const [templateSlideFileNames, setTemplateSlideFileNames] = useState<string[]>([]);
   const [presentationNotes, setPresentationNotes] = useState("");
   const [presentationNotesFileDataUrl, setPresentationNotesFileDataUrl] = useState<string | null>(null);
   const [presentationNotesFileName, setPresentationNotesFileName] = useState<string | null>(null);
   const [zoneMap, setZoneMap] = useState<ZoneMap>({});
+  const [detectingZoneIndexes, setDetectingZoneIndexes] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fallbackWarning, setFallbackWarning] = useState<string | null>(null);
@@ -155,6 +164,19 @@ export default function Home() {
   const templateSlideInputRef = useRef<HTMLInputElement>(null);
   const notesFileInputRef = useRef<HTMLInputElement>(null);
 
+  // Workflow dialogue state
+  const [workflowPhase, setWorkflowPhase] = useState<WorkflowPhase>("idle");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [sampleSlides, setSampleSlides] = useState<Slide[] | null>(null);
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, chatLoading]);
+
   function readImageAsDataUrl(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -164,16 +186,53 @@ export default function Home() {
     });
   }
 
+  async function renderPdfToImages(file: File): Promise<string[]> {
+    const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+    GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs`;
+
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await getDocument({ data: arrayBuffer }).promise;
+    const pageCount = Math.min(pdf.numPages, 8);
+    const dataUrls: string[] = [];
+
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 1.5 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d")!;
+      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+      dataUrls.push(canvas.toDataURL("image/jpeg", 0.85));
+    }
+
+    return dataUrls;
+  }
+
   function handleFileUpload(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setStyleGuideFileName(file.name);
+
+    if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
+      setStyleGuideFileType("pdf");
+      setStyleGuideImageDataUrl(null);
+      setStyleGuideImageDataUrls([]);
+      renderPdfToImages(file).then((dataUrls) => {
+        setStyleGuideImageDataUrls(dataUrls);
+      }).catch(() => {
+        setError("Failed to render PDF style guide. Try uploading as an image or text file.");
+      });
+      return;
+    }
+
     const reader = new FileReader();
 
     if (file.type.startsWith("image/")) {
       reader.onload = (ev) => {
         setStyleGuideImageDataUrl((ev.target?.result as string) ?? null);
+        setStyleGuideImageDataUrls([]);
         setStyleGuideFileType("image");
       };
       reader.readAsDataURL(file);
@@ -183,6 +242,7 @@ export default function Home() {
     reader.onload = (ev) => {
       setAgentInstructions((ev.target?.result as string) ?? "");
       setStyleGuideImageDataUrl(null);
+      setStyleGuideImageDataUrls([]);
       setStyleGuideFileType("text");
     };
     reader.readAsText(file);
@@ -205,21 +265,61 @@ export default function Home() {
       const dataUrls = await Promise.all(pngFiles.map(readImageAsDataUrl));
       setTemplateSlideImageDataUrls(dataUrls);
       setTemplateSlideFileNames(pngFiles.map((file) => file.name));
+      setZoneMap({});
       setError(null);
+      detectZonesForTemplates(dataUrls);
     } catch {
       setError("Failed to load template slide images.");
     }
   }
 
+  async function detectZonesForTemplates(dataUrls: string[]) {
+    setDetectingZoneIndexes(new Set(dataUrls.map((_, index) => index)));
+
+    await Promise.all(
+      dataUrls.map(async (dataUrl, index) => {
+        try {
+          const res = await fetch("/api/agent/detect-zones", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ imageDataUrl: dataUrl, styleGuide: agentInstructions }),
+          });
+          const data = (await res.json()) as { zones?: TemplateZones; error?: string };
+          if (res.ok && data.zones) {
+            setZoneMap((prev) => (prev[index] ? prev : { ...prev, [index]: data.zones! }));
+          }
+        } catch {
+          // Detection failed silently — user can still draw zones manually.
+        } finally {
+          setDetectingZoneIndexes((prev) => {
+            const next = new Set(prev);
+            next.delete(index);
+            return next;
+          });
+        }
+      })
+    );
+  }
+
   function handleRemoveTemplateSlide(indexToRemove: number) {
     setTemplateSlideImageDataUrls((prev) => prev.filter((_, index) => index !== indexToRemove));
     setTemplateSlideFileNames((prev) => prev.filter((_, index) => index !== indexToRemove));
+    setZoneMap((prev) => {
+      const next: ZoneMap = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        const idx = Number(key);
+        if (idx === indexToRemove) return;
+        next[idx > indexToRemove ? idx - 1 : idx] = value;
+      });
+      return next;
+    });
     setError(null);
   }
 
   function handleClearTemplateSlides() {
     setTemplateSlideImageDataUrls([]);
     setTemplateSlideFileNames([]);
+    setZoneMap({});
     if (templateSlideInputRef.current) {
       templateSlideInputRef.current.value = "";
     }
@@ -252,12 +352,175 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  // ── Workflow handlers ──
+
+  async function handleBeginWorkflow(e: React.FormEvent) {
     e.preventDefault();
+    setError(null);
+    setSlides(null);
+    setReviewMessage(null);
+    setChatMessages([]);
+    setSampleSlides(null);
+    setWorkflowPhase("style_review");
+    setChatLoading(true);
+
+    try {
+      const res = await fetch("/api/agent/style-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          styleGuide: agentInstructions,
+          styleGuideImageDataUrl,
+          styleGuideImageDataUrls,
+          templateSlideImageDataUrls,
+          presentationTitle,
+          zoneMap,
+        }),
+      });
+      const data = await res.json() as { message?: string; sampleSlides?: Slide[]; error?: string };
+      if (!res.ok || data.error) {
+        setError(data.error ?? "Failed to analyze style guide.");
+        setWorkflowPhase("idle");
+        return;
+      }
+      const samples = (data.sampleSlides ?? []).map((s) => ({
+        ...s,
+        showTitle: (s.title ?? "").trim().length > 0,
+        showBody: (s.body ?? "").trim().length > 0,
+        layout: buildEditableLayout(s.layout),
+      }));
+      setSampleSlides(samples.length > 0 ? samples : null);
+      setChatMessages([{ role: "agent", content: data.message ?? "Here are your sample slides." }]);
+    } catch {
+      setError("Network error. Please try again.");
+      setWorkflowPhase("idle");
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  async function handleChatSend() {
+    const trimmed = chatInput.trim();
+    if (!trimmed || chatLoading) return;
+
+    const userMsg: ChatMessage = { role: "user", content: trimmed };
+    const nextMessages = [...chatMessages, userMsg];
+    setChatMessages(nextMessages);
+    setChatInput("");
+    setChatLoading(true);
+
+    const phase = workflowPhase as "style_review" | "notes_clarification";
+
+    try {
+      const res = await fetch("/api/agent/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          phase,
+          messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+          context: {
+            styleGuide: agentInstructions,
+            presentationTitle,
+            currentSampleSlides: sampleSlides ?? [],
+            presentationNotes,
+            zoneMap,
+          },
+        }),
+      });
+      const data = await res.json() as { message?: string; updatedSlides?: Slide[]; error?: string };
+      if (!res.ok || data.error) {
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "agent", content: data.error ?? "Something went wrong." },
+        ]);
+        return;
+      }
+      if (data.updatedSlides && data.updatedSlides.length > 0) {
+        const updated = data.updatedSlides.map((s) => ({
+          ...s,
+          showTitle: (s.title ?? "").trim().length > 0,
+          showBody: (s.body ?? "").trim().length > 0,
+          layout: buildEditableLayout(s.layout),
+        }));
+        setSampleSlides(updated);
+      }
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "agent", content: data.message ?? "" },
+      ]);
+    } catch {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "agent", content: "Network error. Please try again." },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  async function handleContinueToNotes() {
+    setChatLoading(true);
+    setWorkflowPhase("notes_clarification");
+
+    const styleSummary = chatMessages
+      .filter((m) => m.role === "agent")
+      .map((m) => m.content)
+      .join(" ");
+
+    try {
+      const res = await fetch("/api/agent/notes-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          presentationNotes,
+          presentationNotesFileDataUrl,
+          presentationTitle,
+          styleSummary,
+        }),
+      });
+      const data = await res.json() as { message?: string; error?: string };
+      if (!res.ok || data.error) {
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "agent", content: data.error ?? "Failed to analyze notes." },
+        ]);
+        return;
+      }
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "agent", content: data.message ?? "I've reviewed your notes. Ready to generate?" },
+      ]);
+    } catch {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "agent", content: "Network error analyzing notes." },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  async function handleGenerateSlides() {
     setError(null);
     setFallbackWarning(null);
     setSlides(null);
+    setReviewMessage(null);
+    setWorkflowPhase("generating");
     setLoading(true);
+
+    // Build additional instructions from notes clarification chat
+    const phase2Messages = chatMessages.filter(
+      (_, i) => {
+        // Find first notes_clarification agent message index
+        const firstNotesIdx = chatMessages.findIndex(
+          (m, idx) => m.role === "agent" && idx > chatMessages.findIndex((m2) => m2.role === "agent")
+        );
+        return i >= firstNotesIdx;
+      }
+    );
+    const dialogueSummary = phase2Messages.length > 0
+      ? phase2Messages.map((m) => `${m.role === "agent" ? "Agent" : "User"}: ${m.content}`).join("\n")
+      : "";
 
     try {
       const res = await fetch("/api/generate", {
@@ -265,8 +528,11 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           presentationTitle,
-          styleGuide: agentInstructions,
+          styleGuide: dialogueSummary
+            ? `${agentInstructions}\n\n--- Notes clarification ---\n${dialogueSummary}`
+            : agentInstructions,
           styleGuideImageDataUrl,
+          styleGuideImageDataUrls,
           templateSlideImageDataUrls,
           presentationNotes,
           presentationNotesFileDataUrl,
@@ -276,28 +542,67 @@ export default function Home() {
       const data: GenerateResponse = await res.json();
       if (!res.ok || data.error) {
         setError(data.error ?? "Failed to generate slides.");
-      } else {
-        const nextSlides = (data.slides ?? []).map((slide) => ({
-          ...slide,
-          showTitle: hasSlideText(slide, "title"),
-          showBody: hasSlideText(slide, "body"),
-          layout: buildEditableLayout(slide.layout),
-        }));
-        setSlides(nextSlides);
-        setSelectedSlideIndex(0);
-        setApprovedSlides(nextSlides.map(() => false));
-        if (data.fallbackTypes && data.fallbackTypes.length > 0) {
-          setFallbackWarning(
-            `No zones were defined for: ${data.fallbackTypes.join(", ")} slides. Default layout was used. Define zones on your templates before generating for accurate placement.`
-          );
-        }
+        setWorkflowPhase("notes_clarification");
+        return;
       }
+      const nextSlides = (data.slides ?? []).map((slide) => ({
+        ...slide,
+        showTitle: hasSlideText(slide, "title"),
+        showBody: hasSlideText(slide, "body"),
+        layout: buildEditableLayout(slide.layout),
+      }));
+      setSlides(nextSlides);
+      setSelectedSlideIndex(0);
+      setApprovedSlides(nextSlides.map(() => false));
+      if (data.fallbackTypes && data.fallbackTypes.length > 0) {
+        setFallbackWarning(
+          `No zones were defined for: ${data.fallbackTypes.join(", ")} slides. Default layout was used.`
+        );
+      }
+      setWorkflowPhase("complete");
+
+      // Kick off post-generation review
+      triggerSlideReview(nextSlides);
     } catch {
       setError("Network error. Please try again.");
+      setWorkflowPhase("notes_clarification");
     } finally {
       setLoading(false);
     }
   }
+
+  async function triggerSlideReview(generatedSlides: Slide[]) {
+    try {
+      const res = await fetch("/api/agent/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          slides: generatedSlides,
+          styleGuide: agentInstructions,
+          presentationTitle,
+        }),
+      });
+      const data = await res.json() as { message?: string; error?: string };
+      if (res.ok && data.message) {
+        setReviewMessage(data.message);
+      }
+    } catch {
+      // Review is non-critical — silently skip on error
+    }
+  }
+
+  function resetWorkflow() {
+    setWorkflowPhase("idle");
+    setChatMessages([]);
+    setChatInput("");
+    setSampleSlides(null);
+    setSlides(null);
+    setReviewMessage(null);
+    setError(null);
+    setFallbackWarning(null);
+  }
+
+  // ── Existing download / slide handlers ──
 
   async function downloadPNGs() {
     if (!slides || slides.length === 0) return;
@@ -348,7 +653,6 @@ export default function Home() {
           });
         }
 
-        // Background
         if (templateImage) {
           ctx.drawImage(templateImage, 0, 0, W, H);
         } else {
@@ -373,7 +677,6 @@ export default function Home() {
 
         ctx.textBaseline = "top";
 
-        // Title
         if (showTitle) {
           ctx.fillStyle = resolvedTextColor;
           ctx.font = `bold ${layout.titleFontSize}px Arial`;
@@ -392,7 +695,6 @@ export default function Home() {
           }
         }
 
-        // Body
         if (showBody) {
           ctx.fillStyle = resolvedTextColor;
           ctx.font = `${layout.bodyFontSize}px Arial`;
@@ -478,20 +780,16 @@ export default function Home() {
       if (!currentSlides) return currentSlides;
       return currentSlides.map((slide, slideIndex) =>
         slideIndex === index
-          ? {
-              ...slide,
-              layout: buildEditableLayout(nextLayout),
-            }
+          ? { ...slide, layout: buildEditableLayout(nextLayout) }
           : slide
       );
     });
-
     setApprovedSlides((currentApprovals) =>
       currentApprovals.map((approved, slideIndex) => (slideIndex === index ? false : approved))
     );
   }
 
-function updateSlideStyleField(
+  function updateSlideStyleField(
     index: number,
     field: "textColor" | "titleFontSize" | "bodyFontSize",
     rawValue: string
@@ -501,10 +799,7 @@ function updateSlideStyleField(
 
     const currentLayout = getSlideLayout(currentSlide);
     if (field === "textColor") {
-      updateSlideLayout(index, {
-        ...currentLayout,
-        textColor: rawValue || "#FFFFFF",
-      });
+      updateSlideLayout(index, { ...currentLayout, textColor: rawValue || "#FFFFFF" });
       return;
     }
 
@@ -525,7 +820,6 @@ function updateSlideStyleField(
 
     setSlides((currentSlides) => {
       if (!currentSlides) return currentSlides;
-
       return currentSlides.map((slide) => {
         const currentLayout = getSlideLayout(slide);
         return {
@@ -547,19 +841,17 @@ function updateSlideStyleField(
       if (!currentSlides) return currentSlides;
       return currentSlides.map((slide, slideIndex) => {
         if (slideIndex !== index) return slide;
-
         return field === "title"
           ? { ...slide, showTitle: visible }
           : { ...slide, showBody: visible };
       });
     });
-
     setApprovedSlides((currentApprovals) =>
       currentApprovals.map((approved, slideIndex) => (slideIndex === index ? false : approved))
     );
   }
 
-function approveSlide(index: number) {
+  function approveSlide(index: number) {
     setApprovedSlides((currentApprovals) =>
       currentApprovals.map((approved, slideIndex) => (slideIndex === index ? true : approved))
     );
@@ -572,6 +864,12 @@ function approveSlide(index: number) {
   const approvedCount = approvedSlides.filter(Boolean).length;
   const allSlidesApproved = slides ? slides.length > 0 && approvedCount === slides.length : false;
   const selectedSlide = slides?.[selectedSlideIndex] ?? null;
+
+  const canBeginWorkflow =
+    !loading &&
+    workflowPhase === "idle" &&
+    presentationTitle.trim().length > 0 &&
+    (presentationNotes.trim().length > 0 || presentationNotesFileDataUrl !== null);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 text-white">
@@ -587,213 +885,379 @@ function approveSlide(index: number) {
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-10">
-        <form onSubmit={handleSubmit} className="space-y-6">
-          {/* Presentation Title */}
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-slate-200">
-              Presentation Title <span className="text-red-400">*</span>
-            </label>
-            <input
-              type="text"
-              value={presentationTitle}
-              onChange={(e) => setPresentationTitle(e.target.value)}
-              required
-              placeholder="e.g. Sunday Service – Week 1"
-              className="w-full rounded-lg border border-white/10 bg-white/5 px-4 py-2.5 text-white placeholder-slate-500 outline-none ring-0 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
-            />
-          </div>
 
-          <div className="grid gap-6 md:grid-cols-2">
-            {/* Style Guide */}
-            <div className="flex flex-col">
-              <div className="mb-1.5 flex items-center justify-between">
-                <label className="text-sm font-medium text-slate-200">
-                  Agent Instructions
-                  <span className="ml-1.5 text-xs text-slate-500">(optional)</span>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/20"
-                >
-                  Upload file
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".txt,.md,.json,.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
-                  className="hidden"
-                  onChange={handleFileUpload}
-                />
-              </div>
-              {styleGuideFileName && (
-                <div className="mb-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-xs text-emerald-300">
-                  <p>
-                    Style guide uploaded: <span className="font-medium">{styleGuideFileName}</span>
-                  </p>
-                  <p className="mt-0.5 text-emerald-200/80">
-                    {styleGuideFileType === "image"
-                      ? "Image guide will be OCR-scanned during generation."
-                      : "Text guide is loaded and ready."}
-                  </p>
-                </div>
-              )}
-              <textarea
-                value={agentInstructions}
-                onChange={(e) => setAgentInstructions(e.target.value)}
-                placeholder={`Instructions for the AI agent — controls tone, formatting, and slide structure.\n\nExamples:\n- Dark background, white text\n- Title in bold, 60pt\n- Keep each slide to 3 lines max\n- Use a professional, concise tone\n- Avoid scripture references unless explicitly in the notes`}
-                rows={10}
-                className="flex-1 resize-none rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
+        {/* Input form — hidden once workflow is active */}
+        {workflowPhase === "idle" && (
+          <form onSubmit={handleBeginWorkflow} className="space-y-6">
+            {/* Presentation Title */}
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-200">
+                Presentation Title <span className="text-red-400">*</span>
+              </label>
+              <input
+                type="text"
+                value={presentationTitle}
+                onChange={(e) => setPresentationTitle(e.target.value)}
+                required
+                placeholder="e.g. Sunday Service – Week 1"
+                className="w-full rounded-lg border border-white/10 bg-white/5 px-4 py-2.5 text-white placeholder-slate-500 outline-none ring-0 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
               />
-              <div className="mt-3">
+            </div>
+
+            <div className="grid gap-6 md:grid-cols-2">
+              {/* Style Guide */}
+              <div className="flex flex-col">
                 <div className="mb-1.5 flex items-center justify-between">
                   <label className="text-sm font-medium text-slate-200">
-                    Template Slides
-                    <span className="ml-1.5 text-xs text-slate-500">(PNG, optional)</span>
+                    Agent Instructions
+                    <span className="ml-1.5 text-xs text-slate-500">(optional)</span>
                   </label>
                   <button
                     type="button"
-                    onClick={() => templateSlideInputRef.current?.click()}
+                    onClick={() => fileInputRef.current?.click()}
                     className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/20"
                   >
-                    Upload templates
+                    Upload file
                   </button>
                   <input
-                    ref={templateSlideInputRef}
+                    ref={fileInputRef}
                     type="file"
-                    accept=".png,image/png"
-                    multiple
+                    accept=".txt,.md,.json,.pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
                     className="hidden"
-                    onChange={handleTemplateSlidesUpload}
+                    onChange={handleFileUpload}
                   />
                 </div>
-                {templateSlideFileNames.length > 0 && (
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="text-xs text-slate-500">
-                        {templateSlideFileNames.length} template slide{templateSlideFileNames.length === 1 ? "" : "s"} — draw text zones on each
-                      </p>
-                      <button
-                        type="button"
-                        onClick={handleClearTemplateSlides}
-                        className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-medium text-slate-300 transition hover:bg-white/10"
-                      >
-                        Clear all
-                      </button>
-                    </div>
-                    {templateSlideImageDataUrls.map((dataUrl, index) => (
-                      <div
-                        key={`${templateSlideFileNames[index] ?? "template"}-${index}`}
-                        className="rounded-lg border border-white/10 bg-black/30 p-2"
-                      >
-                        <div className="mb-1.5 flex items-center justify-between">
-                          <div>
-                            <p className="text-[10px] font-medium uppercase tracking-wide text-cyan-300/90">
-                              {getTemplateRoleLabel(index)}
-                            </p>
-                            <p className="truncate text-[10px] text-slate-400">
-                              {templateSlideFileNames[index] ?? `Template ${index + 1}`}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveTemplateSlide(index)}
-                            aria-label={`Remove template slide ${index + 1}`}
-                            className="rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white transition hover:bg-red-600/80"
-                          >
-                            Remove
-                          </button>
-                        </div>
-                        <TemplateZoneEditor
-                          imageUrl={dataUrl}
-                          zones={zoneMap[index] ?? {}}
-                          onChange={(zones) =>
-                            setZoneMap((prev) => ({ ...prev, [index]: zones }))
-                          }
-                        />
-                      </div>
-                    ))}
+                {styleGuideFileName && (
+                  <div className="mb-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-xs text-emerald-300">
+                    <p>
+                      Style guide uploaded: <span className="font-medium">{styleGuideFileName}</span>
+                    </p>
+                    <p className="mt-0.5 text-emerald-200/80">
+                      {styleGuideFileType === "pdf"
+                        ? styleGuideImageDataUrls.length > 0
+                          ? `PDF rendered as ${styleGuideImageDataUrls.length} page image${styleGuideImageDataUrls.length === 1 ? "" : "s"} — Claude will see your style guide visually.`
+                          : "Rendering PDF pages…"
+                        : styleGuideFileType === "image"
+                          ? "Image guide will be OCR-scanned during generation."
+                          : "Text guide is loaded and ready."}
+                    </p>
                   </div>
                 )}
+                <textarea
+                  value={agentInstructions}
+                  onChange={(e) => setAgentInstructions(e.target.value)}
+                  placeholder={`Instructions for the AI agent — controls tone, formatting, and slide structure.\n\nExamples:\n- Dark background, white text\n- Title in bold, 60pt\n- Keep each slide to 3 lines max\n- Use a professional, concise tone\n- Avoid scripture references unless explicitly in the notes`}
+                  rows={10}
+                  className="flex-1 resize-none rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
+                />
+                <div className="mt-3">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <label className="text-sm font-medium text-slate-200">
+                      Template Slides
+                      <span className="ml-1.5 text-xs text-slate-500">(PNG, optional)</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => templateSlideInputRef.current?.click()}
+                      className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/20"
+                    >
+                      Upload templates
+                    </button>
+                    <input
+                      ref={templateSlideInputRef}
+                      type="file"
+                      accept=".png,image/png"
+                      multiple
+                      className="hidden"
+                      onChange={handleTemplateSlidesUpload}
+                    />
+                  </div>
+                  {templateSlideFileNames.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs text-slate-500">
+                          {templateSlideFileNames.length} template slide{templateSlideFileNames.length === 1 ? "" : "s"} — text zones are auto-detected; drag to adjust
+                        </p>
+                        <button
+                          type="button"
+                          onClick={handleClearTemplateSlides}
+                          className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-medium text-slate-300 transition hover:bg-white/10"
+                        >
+                          Clear all
+                        </button>
+                      </div>
+                      {templateSlideImageDataUrls.map((dataUrl, index) => (
+                        <div
+                          key={`${templateSlideFileNames[index] ?? "template"}-${index}`}
+                          className="rounded-lg border border-white/10 bg-black/30 p-2"
+                        >
+                          <div className="mb-1.5 flex items-center justify-between">
+                            <div>
+                              <p className="text-[10px] font-medium uppercase tracking-wide text-cyan-300/90">
+                                {getTemplateRoleLabel(index)}
+                              </p>
+                              <p className="truncate text-[10px] text-slate-400">
+                                {templateSlideFileNames[index] ?? `Template ${index + 1}`}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveTemplateSlide(index)}
+                              aria-label={`Remove template slide ${index + 1}`}
+                              className="rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white transition hover:bg-red-600/80"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                          <TemplateZoneEditor
+                            imageUrl={dataUrl}
+                            zones={zoneMap[index] ?? {}}
+                            detecting={detectingZoneIndexes.has(index)}
+                            onChange={(zones) =>
+                              setZoneMap((prev) => ({ ...prev, [index]: zones }))
+                            }
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
 
-            {/* Presentation Notes */}
-            <div className="flex flex-col">
-              <div className="mb-1.5 flex items-center justify-between">
-                <label className="block text-sm font-medium text-slate-200">
-                  Presentation Notes / Content <span className="text-red-400">*</span>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => notesFileInputRef.current?.click()}
-                  className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/20"
-                >
-                  Upload PDF/DOCX
-                </button>
-                <input
-                  ref={notesFileInputRef}
-                  type="file"
-                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                  className="hidden"
-                  onChange={handleNotesFileUpload}
+              {/* Presentation Notes */}
+              <div className="flex flex-col">
+                <div className="mb-1.5 flex items-center justify-between">
+                  <label className="block text-sm font-medium text-slate-200">
+                    Presentation Notes / Content <span className="text-red-400">*</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => notesFileInputRef.current?.click()}
+                    className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/20"
+                  >
+                    Upload PDF/DOCX
+                  </button>
+                  <input
+                    ref={notesFileInputRef}
+                    type="file"
+                    accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    className="hidden"
+                    onChange={handleNotesFileUpload}
+                  />
+                </div>
+                {presentationNotesFileName && (
+                  <div className="mb-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-xs text-emerald-300">
+                    Notes document uploaded: <span className="font-medium">{presentationNotesFileName}</span>
+                  </div>
+                )}
+                <textarea
+                  value={presentationNotes}
+                  onChange={(e) => setPresentationNotes(e.target.value)}
+                  placeholder={`Paste notes here, or upload a PDF/DOCX file with sermon content and styles.\n\nExample:\n- Welcome and announcements\n- Scripture: John 3:16\n- Main message: God's love and grace\n- Three points: Faith, Hope, Love\n- Closing prayer and benediction`}
+                  rows={10}
+                  className="flex-1 resize-none rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
                 />
               </div>
-              {presentationNotesFileName && (
-                <div className="mb-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-xs text-emerald-300">
-                  Notes document uploaded: <span className="font-medium">{presentationNotesFileName}</span>
-                </div>
-              )}
-              <textarea
-                value={presentationNotes}
-                onChange={(e) => setPresentationNotes(e.target.value)}
-                placeholder={`Paste notes here, or upload a PDF/DOCX file with sermon content and styles.\n\nExample:\n- Welcome and announcements\n- Scripture: John 3:16\n- Main message: God's love and grace\n- Three points: Faith, Hope, Love\n- Closing prayer and benediction`}
-                rows={10}
-                className="flex-1 resize-none rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30"
-              />
             </div>
-          </div>
 
-          {/* Submit */}
-          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-4">
+              <button
+                type="submit"
+                disabled={!canBeginWorkflow}
+                className="rounded-lg bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Begin Review →
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Compact header shown once workflow is active */}
+        {workflowPhase !== "idle" && (
+          <div className="mb-6 flex items-center justify-between rounded-xl border border-white/10 bg-white/5 px-5 py-3">
+            <div>
+              <p className="text-sm font-semibold text-white">{presentationTitle}</p>
+              <p className="text-xs text-slate-400">
+                {presentationNotesFileName
+                  ? presentationNotesFileName
+                  : presentationNotes.slice(0, 60).trim() + (presentationNotes.length > 60 ? "…" : "")}
+              </p>
+            </div>
             <button
-              type="submit"
-              disabled={
-                loading ||
-                !presentationTitle.trim() ||
-                (!presentationNotes.trim() && !presentationNotesFileDataUrl)
-              }
-              className="rounded-lg bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+              onClick={resetWorkflow}
+              className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-white/10"
             >
-              {loading ? "Generating slides…" : "Generate Slides"}
+              ← Edit inputs
             </button>
-            {slides && slides.length > 0 && (
-              <button
-                type="button"
-                onClick={downloadPro}
-                disabled={downloading || !allSlidesApproved}
-                className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-6 py-2.5 text-sm font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-50"
-              >
-                {downloading ? "Preparing .pro…" : allSlidesApproved ? "⬇ Download .pro" : "Approve layouts to export .pro"}
-              </button>
-            )}
-            {slides && slides.length > 0 && (
-              <button
-                type="button"
-                onClick={downloadPNGs}
-                disabled={downloading || !allSlidesApproved}
-                className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-6 py-2.5 text-sm font-semibold text-blue-300 transition hover:bg-blue-500/20 disabled:opacity-50"
-              >
-                {downloading ? "Generating PNGs…" : allSlidesApproved ? "⬇ Download PNGs" : "Approve layouts to export PNGs"}
-              </button>
-            )}
           </div>
-        </form>
+        )}
 
         {/* Error */}
         {error && (
           <div className="mt-6 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
             <strong>Error:</strong> {error}
+          </div>
+        )}
+
+        {/* Workflow dialogue panel */}
+        {(workflowPhase === "style_review" || workflowPhase === "notes_clarification") && (
+          <section className="mt-6 overflow-hidden rounded-2xl border border-white/10 bg-slate-900/60">
+
+            {/* Phase progress bar */}
+            <div className="flex items-center gap-0 border-b border-white/10 bg-black/20">
+              <div
+                className={`flex flex-1 items-center justify-center gap-2 px-4 py-3 text-xs font-medium transition ${
+                  workflowPhase === "style_review"
+                    ? "bg-cyan-500/15 text-cyan-300"
+                    : "text-emerald-400"
+                }`}
+              >
+                {workflowPhase === "style_review" ? (
+                  <span className="h-2 w-2 rounded-full bg-cyan-400 animate-pulse" />
+                ) : (
+                  <span className="text-emerald-400">✓</span>
+                )}
+                Step 1 — Style Review
+              </div>
+              <div className="w-px self-stretch bg-white/10" />
+              <div
+                className={`flex flex-1 items-center justify-center gap-2 px-4 py-3 text-xs font-medium transition ${
+                  workflowPhase === "notes_clarification"
+                    ? "bg-amber-500/15 text-amber-300"
+                    : "text-slate-500"
+                }`}
+              >
+                {workflowPhase === "notes_clarification" && (
+                  <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+                )}
+                Step 2 — Notes Review
+              </div>
+              <div className="w-px self-stretch bg-white/10" />
+              <div className="flex flex-1 items-center justify-center gap-2 px-4 py-3 text-xs font-medium text-slate-600">
+                Step 3 — Generate
+              </div>
+            </div>
+
+            {/* Sample slides (Phase 1) */}
+            {workflowPhase === "style_review" && sampleSlides && sampleSlides.length > 0 && (
+              <div className="border-b border-white/10 px-6 py-5">
+                <p className="mb-3 text-xs font-medium uppercase tracking-widest text-slate-400">
+                  Sample Slides
+                </p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {sampleSlides.map((slide, i) => (
+                    <div key={i}>
+                      <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                        {slide.slideType === "scripture" ? "Scripture template" : "Point template"}
+                      </p>
+                      <SampleSlidePreview
+                        slide={slide}
+                        templateImageDataUrl={resolveTemplateForSlide(slide, templateSlideImageDataUrls)}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Chat messages */}
+            <div className="max-h-80 space-y-4 overflow-y-auto px-6 py-5">
+              {chatMessages.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`max-w-[82%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                      msg.role === "user"
+                        ? "bg-blue-600 text-white"
+                        : "bg-white/10 text-slate-200"
+                    }`}
+                  >
+                    {msg.content}
+                  </div>
+                </div>
+              ))}
+              {chatLoading && (
+                <div className="flex justify-start">
+                  <div className="rounded-2xl bg-white/10 px-4 py-3 text-sm text-slate-400">
+                    <span className="inline-flex gap-1">
+                      <span className="animate-bounce" style={{ animationDelay: "0ms" }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: "150ms" }}>.</span>
+                      <span className="animate-bounce" style={{ animationDelay: "300ms" }}>.</span>
+                    </span>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            {/* Chat input + action buttons */}
+            <div className="border-t border-white/10 px-6 py-4">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      handleChatSend();
+                    }
+                  }}
+                  placeholder={
+                    workflowPhase === "style_review"
+                      ? "Ask to adjust font size, alignment, content structure…"
+                      : "Answer questions or add clarifications…"
+                  }
+                  disabled={chatLoading}
+                  className="flex-1 rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500 disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  onClick={handleChatSend}
+                  disabled={chatLoading || !chatInput.trim()}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+                >
+                  Send
+                </button>
+              </div>
+
+              <div className="mt-3 flex justify-end">
+                {workflowPhase === "style_review" && (
+                  <button
+                    type="button"
+                    onClick={handleContinueToNotes}
+                    disabled={chatLoading}
+                    className="rounded-lg bg-cyan-600 px-5 py-2 text-sm font-semibold text-white transition hover:bg-cyan-500 disabled:opacity-50"
+                  >
+                    Continue to Notes Review →
+                  </button>
+                )}
+                {workflowPhase === "notes_clarification" && (
+                  <button
+                    type="button"
+                    onClick={handleGenerateSlides}
+                    disabled={chatLoading}
+                    className="rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+                  >
+                    Generate Slides →
+                  </button>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Generating spinner */}
+        {workflowPhase === "generating" && (
+          <div className="mt-10 flex flex-col items-center gap-4 py-16 text-slate-400">
+            <svg className="h-10 w-10 animate-spin text-blue-500" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 100 16v-4l-3 3 3 3v-4a8 8 0 01-8-8z" />
+            </svg>
+            <p className="text-sm">Generating slides…</p>
           </div>
         )}
 
@@ -807,6 +1271,22 @@ function approveSlide(index: number) {
         {/* Slide Preview */}
         {slides && slides.length > 0 && (
           <section className="mt-10">
+
+            {/* Agent review banner */}
+            {reviewMessage && (
+              <div className="mb-6 rounded-xl border border-purple-500/30 bg-purple-500/10 px-5 py-4">
+                <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-purple-400">
+                  Agent Review
+                </p>
+                <p className="text-sm leading-relaxed text-purple-100">{reviewMessage}</p>
+              </div>
+            )}
+            {!reviewMessage && workflowPhase === "complete" && (
+              <div className="mb-6 rounded-xl border border-white/10 bg-white/5 px-5 py-4 text-sm text-slate-400">
+                Reviewing slides against your style guide…
+              </div>
+            )}
+
             <div className="mb-4 rounded-2xl border border-cyan-400/20 bg-cyan-500/10 p-4">
               <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                 <div>
@@ -828,6 +1308,29 @@ function approveSlide(index: number) {
                   >
                     Approve all current layouts
                   </button>
+                  {allSlidesApproved && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={downloadPro}
+                        disabled={downloading}
+                        className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-50"
+                      >
+                        {downloading ? "Preparing…" : "⬇ Download .pro"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={downloadPNGs}
+                        disabled={downloading}
+                        className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-4 py-2 text-sm font-semibold text-blue-300 transition hover:bg-blue-500/20 disabled:opacity-50"
+                      >
+                        {downloading ? "Generating…" : "⬇ Download PNGs"}
+                      </button>
+                    </>
+                  )}
+                  {!allSlidesApproved && (
+                    <p className="text-xs text-slate-500">Approve all slides to export</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -1032,6 +1535,72 @@ function approveSlide(index: number) {
   );
 }
 
+function SampleSlidePreview({
+  slide,
+  templateImageDataUrl,
+}: {
+  slide: Slide;
+  templateImageDataUrl: string | null;
+}) {
+  const layout = getSlideLayout(slide);
+  const showTitle = isSlideTextVisible(slide, "title");
+  const showBody = isSlideTextVisible(slide, "body");
+
+  return (
+    <div
+      className="relative overflow-hidden rounded-xl bg-black"
+      style={{ aspectRatio: "16/9" }}
+    >
+      {templateImageDataUrl && (
+        <Image
+          src={templateImageDataUrl}
+          alt="Template background"
+          fill
+          unoptimized
+          className="object-cover"
+        />
+      )}
+      {showTitle && (
+        <p
+          className="absolute whitespace-pre-line font-bold leading-snug"
+          style={{
+            left: `${layout.titleBox.x}%`,
+            top: `${layout.titleBox.y}%`,
+            width: `${layout.titleBox.width}%`,
+            height: `${layout.titleBox.height}%`,
+            color: layout.textColor,
+            textAlign: layout.titleBox.align,
+            fontSize: `${Math.max(10, Math.round(layout.titleFontSize / 5))}px`,
+          }}
+        >
+          {slide.title}
+        </p>
+      )}
+      {showBody && (
+        <p
+          className="absolute whitespace-pre-line leading-relaxed"
+          style={{
+            left: `${layout.bodyBox.x}%`,
+            top: `${layout.bodyBox.y}%`,
+            width: `${layout.bodyBox.width}%`,
+            height: `${layout.bodyBox.height}%`,
+            color: layout.textColor,
+            textAlign: layout.bodyBox.align,
+            fontSize: `${Math.max(9, Math.round(layout.bodyFontSize / 5))}px`,
+          }}
+        >
+          {slide.body}
+        </p>
+      )}
+      {!showTitle && !showBody && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <span className="rounded bg-black/60 px-2 py-1 text-[10px] text-slate-400">Empty slide</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SlideCard({
   slide,
   index,
@@ -1068,7 +1637,6 @@ function SlideCard({
           : "border-white/10 hover:border-white/25"
       }`}
     >
-      {/* Slide preview (16:9 aspect) */}
       <div
         className="relative flex flex-col items-start justify-start bg-black p-4"
         style={{ aspectRatio: "16/9" }}
@@ -1083,53 +1651,52 @@ function SlideCard({
           />
         )}
         <div className="relative z-10 h-full w-full">
-        <div className="mb-2 flex items-center justify-between">
-          <span className="text-[10px] font-medium text-slate-600">
-            {index + 1}
-          </span>
-          <span
-            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-              approved ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"
-            }`}
-          >
-            {approved ? "Approved" : "Pending"}
-          </span>
-        </div>
-        {showTitle && (
-          <p
-            className="absolute whitespace-pre-line text-base font-bold leading-snug"
-            style={{
-              left: `${layout.titleBox.x}%`,
-              top: `${layout.titleBox.y}%`,
-              width: `${layout.titleBox.width}%`,
-              height: `${layout.titleBox.height}%`,
-              color: layout.textColor,
-              textAlign: layout.titleBox.align,
-              fontSize: `${Math.max(10, Math.round(layout.titleFontSize / 5))}px`,
-            }}
-          >
-            {slide.title}
-          </p>
-        )}
-        {showBody && (
-          <p
-            className="absolute whitespace-pre-line leading-relaxed"
-            style={{
-              left: `${layout.bodyBox.x}%`,
-              top: `${layout.bodyBox.y}%`,
-              width: `${layout.bodyBox.width}%`,
-              height: `${layout.bodyBox.height}%`,
-              color: layout.textColor,
-              textAlign: layout.bodyBox.align,
-              fontSize: `${Math.max(9, Math.round(layout.bodyFontSize / 5))}px`,
-            }}
-          >
-            {slide.body}
-          </p>
-        )}
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[10px] font-medium text-slate-600">
+              {index + 1}
+            </span>
+            <span
+              className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                approved ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"
+              }`}
+            >
+              {approved ? "Approved" : "Pending"}
+            </span>
+          </div>
+          {showTitle && (
+            <p
+              className="absolute whitespace-pre-line text-base font-bold leading-snug"
+              style={{
+                left: `${layout.titleBox.x}%`,
+                top: `${layout.titleBox.y}%`,
+                width: `${layout.titleBox.width}%`,
+                height: `${layout.titleBox.height}%`,
+                color: layout.textColor,
+                textAlign: layout.titleBox.align,
+                fontSize: `${Math.max(10, Math.round(layout.titleFontSize / 5))}px`,
+              }}
+            >
+              {slide.title}
+            </p>
+          )}
+          {showBody && (
+            <p
+              className="absolute whitespace-pre-line leading-relaxed"
+              style={{
+                left: `${layout.bodyBox.x}%`,
+                top: `${layout.bodyBox.y}%`,
+                width: `${layout.bodyBox.width}%`,
+                height: `${layout.bodyBox.height}%`,
+                color: layout.textColor,
+                textAlign: layout.bodyBox.align,
+                fontSize: `${Math.max(9, Math.round(layout.bodyFontSize / 5))}px`,
+              }}
+            >
+              {slide.body}
+            </p>
+          )}
         </div>
       </div>
-      {/* Presenter notes toggle */}
       {slide.notes && (
         <div className="border-t border-white/10 bg-slate-900/60 px-3 py-2">
           <button
@@ -1243,10 +1810,12 @@ function LayoutEditorPreview({
 function TemplateZoneEditor({
   imageUrl,
   zones,
+  detecting,
   onChange,
 }: {
   imageUrl: string;
   zones: TemplateZones;
+  detecting?: boolean;
   onChange: (zones: TemplateZones) => void;
 }) {
   const [activeZoneType, setActiveZoneType] = useState<"title" | "body">("title");
@@ -1254,7 +1823,6 @@ function TemplateZoneEditor({
     x: number; y: number; width: number; height: number;
   } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Refs keep current values accessible inside the window listener (set once on mount)
   const drawStartRef = useRef<{ x: number; y: number } | null>(null);
   const activeZoneTypeRef = useRef(activeZoneType);
   activeZoneTypeRef.current = activeZoneType;
@@ -1352,12 +1920,20 @@ function TemplateZoneEditor({
       <div
         ref={containerRef}
         className="relative select-none overflow-hidden rounded-lg bg-black touch-none"
-        style={{ aspectRatio: "16/9", cursor: drawPreview ? "crosshair" : "crosshair" }}
+        style={{ aspectRatio: "16/9", cursor: "crosshair" }}
         onPointerDown={handlePointerDown}
       >
         <Image src={imageUrl} alt="Template" fill unoptimized draggable={false} className="object-cover pointer-events-none" />
 
-        {hasNoZones && !drawPreview && (
+        {detecting && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/40">
+            <span className="rounded-full border border-cyan-500/40 bg-cyan-500/20 px-3 py-1 text-[11px] font-medium text-cyan-300">
+              Detecting text zones…
+            </span>
+          </div>
+        )}
+
+        {!detecting && hasNoZones && !drawPreview && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <span className="rounded-full border border-amber-500/40 bg-amber-500/20 px-3 py-1 text-[11px] font-medium text-amber-300">
               Zones not set — click and drag to draw
@@ -1430,4 +2006,3 @@ function TemplateZoneEditor({
     </div>
   );
 }
-

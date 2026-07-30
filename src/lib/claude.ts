@@ -60,6 +60,7 @@ export interface GenerateRequest {
   presentationNotes: string;
   presentationTitle: string;
   templateSlideImageDataUrls?: string[];
+  styleGuideImageDataUrls?: string[];
   zoneMap?: ZoneMap;
 }
 
@@ -422,9 +423,11 @@ export async function generateSlides(req: GenerateRequest): Promise<GenerateResu
   const targetSlideCount = Math.max(1, Math.min(noteSegments.length || 1, 40));
   const segmentBatches = partitionNoteSegments(noteSegments, MAX_SEGMENT_BATCH_CHARS);
   const templateImagesForModel = (req.templateSlideImageDataUrls ?? []).slice(0, 2);
+  const styleGuideImagesForModel = (req.styleGuideImageDataUrls ?? []).slice(0, 6);
   const templateImagePayloadChars = templateImagesForModel.reduce((sum, url) => sum + url.length, 0);
+  const styleGuideImagePayloadChars = styleGuideImagesForModel.reduce((sum, url) => sum + url.length, 0);
   const canIncludeTemplateImages =
-    templateImagesForModel.length > 0 && templateImagePayloadChars <= MAX_TEMPLATE_IMAGE_PAYLOAD_CHARS;
+    templateImagesForModel.length > 0 && templateImagePayloadChars + styleGuideImagePayloadChars <= MAX_TEMPLATE_IMAGE_PAYLOAD_CHARS;
   const trimmedStyleGuide = trimForPrompt(req.styleGuide ?? "", MAX_STYLE_GUIDE_PROMPT_CHARS);
 
   const systemPrompt = trimmedStyleGuide
@@ -491,6 +494,19 @@ If template slide images are provided, use them as visual references for layout,
 
     const buildUserContent = (includeTemplates: boolean): AnthropicContentBlock[] => {
       const content: AnthropicContentBlock[] = [{ type: "text", text: userMessage }];
+
+      if (styleGuideImagesForModel.length > 0) {
+        content.push({ type: "text", text: "Style guide (use these pages as the visual design reference — match colors, fonts, text placement, and layout shown):" });
+        styleGuideImagesForModel.forEach((imageDataUrl, index) => {
+          const parsed = parseImageDataUrl(imageDataUrl);
+          if (!parsed) return;
+          content.push({ type: "text", text: `Style guide page ${index + 1}:` });
+          content.push({
+            type: "image",
+            source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+          });
+        });
+      }
 
       if (includeTemplates) {
         templateImagesForModel.forEach((imageDataUrl, index) => {
@@ -613,6 +629,385 @@ If template slide images are provided, use them as visual references for layout,
   return { slides: normalizedSlides, fallbackTypes: [...fallbackTypes] };
 }
 
+// ==========================================
+// Agent Dialogue Types & Functions
+// ==========================================
+
+export interface AgentChatMessage {
+  role: "user" | "agent";
+  content: string;
+}
+
+export interface StyleReviewResult {
+  message: string;
+  sampleSlides: GeneratedSlide[];
+}
+
+export interface AgentChatResult {
+  message: string;
+  updatedSlides?: GeneratedSlide[];
+}
+
+export interface NotesAnalysisResult {
+  message: string;
+}
+
+export interface SlideReviewResult {
+  message: string;
+}
+
+function buildDefaultLayoutForSlideType(
+  slideType: "point" | "scripture" | "other",
+  zoneMap?: ZoneMap
+): NonNullable<GeneratedSlide["layout"]> {
+  const templateIndex = slideType === "scripture" ? 1 : 0;
+  const zones = zoneMap?.[templateIndex];
+
+  const defaultLayout =
+    slideType === "scripture"
+      ? {
+          titleBox: { x: 10, y: 12, width: 80, height: 16, align: "center" as const },
+          bodyBox: { x: 12, y: 34, width: 76, height: 46, align: "center" as const },
+        }
+      : {
+          titleBox: { x: 10, y: 10, width: 80, height: 14, align: "left" as const },
+          bodyBox: { x: 10, y: 28, width: 80, height: 54, align: "left" as const },
+        };
+
+  const titleBox = zones?.title
+    ? { ...zones.title, align: defaultLayout.titleBox.align }
+    : defaultLayout.titleBox;
+
+  const bodyBox = zones?.body
+    ? { ...zones.body, align: defaultLayout.bodyBox.align }
+    : defaultLayout.bodyBox;
+
+  return {
+    titleBox,
+    bodyBox,
+    textColor: "#FFFFFF",
+    titleFontSize: TITLE_FONT_SIZE,
+    bodyFontSize: BODY_FONT_SIZE,
+  };
+}
+
+export async function analyzeStyleGuideForSamples(params: {
+  styleGuide: string;
+  styleGuideImageDataUrl?: string;
+  styleGuideImageDataUrls?: string[];
+  templateSlideImageDataUrls?: string[];
+  presentationTitle: string;
+  zoneMap?: ZoneMap;
+}): Promise<StyleReviewResult> {
+  const anthropic = getAnthropicClient();
+
+  const systemPrompt = `You are a presentation design assistant for ProPresenter.
+
+Analyze the provided style guide, agent instructions, and any template slide images. Then generate exactly 2 representative sample slides:
+- One "point" type slide demonstrating a typical teaching point
+- One "scripture" type slide demonstrating a typical Bible verse/reference
+
+Use realistic placeholder content appropriate for a church presentation. Match the visual style closely: if the guide says no titles, leave title empty; match text density and tone.
+
+Respond ONLY with valid JSON (no markdown fencing):
+{
+  "message": "2-3 sentences describing what you understood about the presentation style",
+  "sampleSlides": [
+    {"title": "string", "body": "string", "slideType": "point", "notes": ""},
+    {"title": "string", "body": "string", "slideType": "scripture", "notes": ""}
+  ]
+}`;
+
+  const userContent: AnthropicContentBlock[] = [
+    {
+      type: "text",
+      text: `Presentation Title: ${params.presentationTitle}\n\nStyle Guide / Instructions:\n${params.styleGuide || "(None provided)"}`,
+    },
+  ];
+
+  if (params.styleGuideImageDataUrl) {
+    const parsed = parseImageDataUrl(params.styleGuideImageDataUrl);
+    if (parsed) {
+      userContent.push({ type: "text", text: "Style guide image:" });
+      userContent.push({
+        type: "image",
+        source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+      });
+    }
+  }
+
+  const pdfStyleGuideImages = (params.styleGuideImageDataUrls ?? []).slice(0, 6);
+  if (pdfStyleGuideImages.length > 0) {
+    userContent.push({ type: "text", text: "Style guide PDF (match the visual design shown — colors, fonts, text placement, and layout):" });
+    pdfStyleGuideImages.forEach((url, i) => {
+      const parsed = parseImageDataUrl(url);
+      if (!parsed) return;
+      userContent.push({ type: "text", text: `Style guide page ${i + 1}:` });
+      userContent.push({
+        type: "image",
+        source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+      });
+    });
+  }
+
+  (params.templateSlideImageDataUrls ?? []).slice(0, 2).forEach((url, i) => {
+    const parsed = parseImageDataUrl(url);
+    if (!parsed) return;
+    userContent.push({ type: "text", text: `Template ${i + 1} (${i === 0 ? "Point" : "Scripture"}):` });
+    userContent.push({
+      type: "image",
+      source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+    });
+  });
+
+  const zoneLines: string[] = [];
+  [0, 1].forEach((i) => {
+    const zones = params.zoneMap?.[i];
+    if (zones) {
+      const g = buildZoneGuidance(zones, i === 0 ? "Point slide" : "Scripture slide");
+      if (g) zoneLines.push(g);
+    }
+  });
+  if (zoneLines.length > 0) {
+    userContent.push({ type: "text", text: zoneLines.join("\n\n") });
+  }
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userContent }],
+    temperature: 0.7,
+    max_tokens: 1500,
+  });
+
+  const rawContent = response.content[0]?.type === "text" ? response.content[0].text : null;
+  if (!rawContent) throw new Error("No response from agent.");
+
+  try {
+    const firstBrace = rawContent.indexOf("{");
+    const lastBrace = rawContent.lastIndexOf("}");
+    const parsed = JSON.parse(rawContent.slice(firstBrace, lastBrace + 1)) as {
+      message?: string;
+      sampleSlides?: Array<{ title?: string; body?: string; slideType?: string; notes?: string }>;
+    };
+
+    const sampleSlides: GeneratedSlide[] = (parsed.sampleSlides ?? []).map((s) => {
+      const slideType = (s.slideType === "scripture" ? "scripture" : "point") as "point" | "scripture";
+      return {
+        title: s.title ?? "",
+        body: s.body ?? "",
+        notes: s.notes ?? "",
+        slideType,
+        layout: buildDefaultLayoutForSlideType(slideType, params.zoneMap),
+      };
+    });
+
+    return {
+      message: parsed.message ?? "Here are sample slides based on your style guide.",
+      sampleSlides,
+    };
+  } catch {
+    return { message: rawContent, sampleSlides: [] };
+  }
+}
+
+export async function chatInStyleReview(
+  messages: AgentChatMessage[],
+  context: {
+    styleGuide: string;
+    presentationTitle: string;
+    currentSampleSlides: GeneratedSlide[];
+    zoneMap?: ZoneMap;
+  }
+): Promise<AgentChatResult> {
+  const anthropic = getAnthropicClient();
+
+  const systemPrompt = `You are a presentation design assistant for ProPresenter.
+
+Context:
+- Presentation title: ${context.presentationTitle}
+- Style guide: ${context.styleGuide || "(None provided)"}
+
+Current sample slides:
+${JSON.stringify(context.currentSampleSlides, null, 2)}
+
+The user is reviewing sample slides and giving style feedback. Your job:
+1. Respond conversationally to acknowledge their feedback.
+2. ALWAYS return updatedSlides reflecting any changes — even minor ones like wording, capitalization, or content structure. If the user makes any suggestion about style, tone, content, layout, or wording, regenerate both sample slides incorporating that feedback.
+3. Only omit updatedSlides if the user is asking a question with no style change implied (e.g. "what font is this?").
+
+Respond ONLY with valid JSON (no markdown):
+{
+  "message": "your conversational response",
+  "updatedSlides": [
+    {"title": "string", "body": "string", "slideType": "point", "notes": ""},
+    {"title": "string", "body": "string", "slideType": "scripture", "notes": ""}
+  ]
+}`;
+
+  const firstUserIdx = messages.findIndex((m) => m.role === "user");
+  const trimmedMessages = firstUserIdx >= 0 ? messages.slice(firstUserIdx) : messages;
+
+  const anthropicMessages: Anthropic.MessageParam[] = trimmedMessages.map((msg) => ({
+    role: msg.role === "user" ? ("user" as const) : ("assistant" as const),
+    content: msg.content,
+  }));
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: systemPrompt,
+    messages: anthropicMessages,
+    temperature: 0.7,
+    max_tokens: 2000,
+  });
+
+  const rawContent = response.content[0]?.type === "text" ? response.content[0].text : null;
+  if (!rawContent) throw new Error("No response from agent.");
+
+  try {
+    const firstBrace = rawContent.indexOf("{");
+    const lastBrace = rawContent.lastIndexOf("}");
+    const parsed = JSON.parse(rawContent.slice(firstBrace, lastBrace + 1)) as {
+      message?: string;
+      updatedSlides?: GeneratedSlide[];
+    };
+
+    const updatedSlides = parsed.updatedSlides?.map((s) => {
+      const slideType = (
+        s.slideType === "scripture" ? "scripture" : s.slideType === "other" ? "other" : "point"
+      ) as "point" | "scripture" | "other";
+      return {
+        ...s,
+        slideType,
+        layout: s.layout ?? buildDefaultLayoutForSlideType(slideType, context.zoneMap),
+      };
+    });
+
+    return { message: parsed.message ?? rawContent, updatedSlides };
+  } catch {
+    return { message: rawContent };
+  }
+}
+
+export async function analyzeNotesForClarification(params: {
+  presentationNotes: string;
+  presentationTitle: string;
+  styleSummary?: string;
+}): Promise<NotesAnalysisResult> {
+  const anthropic = getAnthropicClient();
+
+  const systemPrompt = `You are a presentation assistant helping prepare sermon/presentation notes for slide creation in ProPresenter.
+
+Your task:
+1. Read the presentation notes carefully
+2. Identify what content is marked for slides (look for "Parsed Highlighted Non-Scripture Points" and "Parsed Highlighted Scripture References" sections, or any highlighted/starred items)
+3. Identify any content in the notes that seems important but is NOT marked for slides
+4. Ask the user 1-3 specific clarifying questions about content inclusion
+
+Be conversational and specific. Reference exact phrases from the notes when asking. If all content looks well-organized, say so and confirm what will be turned into slides.
+
+Respond as plain text — this is a conversational message, not JSON.`;
+
+  const notesPreview = params.presentationNotes.slice(0, 3500);
+  const truncated = params.presentationNotes.length > 3500 ? "\n\n[Notes truncated for preview]" : "";
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: systemPrompt,
+    messages: [
+      {
+        role: "user",
+        content: `Presentation Title: ${params.presentationTitle}\n\n${
+          params.styleSummary ? `Style context: ${params.styleSummary}\n\n` : ""
+        }Presentation Notes:\n${notesPreview}${truncated}`,
+      },
+    ],
+    temperature: 0.7,
+    max_tokens: 800,
+  });
+
+  const message =
+    response.content[0]?.type === "text"
+      ? response.content[0].text.trim()
+      : "I've reviewed your notes. Everything looks good — shall we proceed to generate the slides?";
+
+  return { message };
+}
+
+export async function chatInNotesClarification(
+  messages: AgentChatMessage[],
+  context: { presentationTitle: string }
+): Promise<AgentChatResult> {
+  const anthropic = getAnthropicClient();
+
+  const systemPrompt = `You are a presentation assistant helping clarify presentation notes for slide generation.
+
+Presentation title: ${context.presentationTitle}
+
+Answer questions, confirm decisions, and note what should be included or excluded. When the user is ready to proceed, acknowledge that you have everything you need. Keep responses concise.
+
+Respond as plain text — conversational, not JSON.`;
+
+  const anthropicMessages: Anthropic.MessageParam[] = messages.map((msg) => ({
+    role: msg.role === "user" ? ("user" as const) : ("assistant" as const),
+    content: msg.content,
+  }));
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: systemPrompt,
+    messages: anthropicMessages,
+    temperature: 0.7,
+    max_tokens: 500,
+  });
+
+  const message =
+    response.content[0]?.type === "text" ? response.content[0].text.trim() : "Got it!";
+  return { message };
+}
+
+export async function reviewGeneratedSlides(params: {
+  slides: GeneratedSlide[];
+  styleGuide: string;
+  presentationTitle: string;
+}): Promise<SlideReviewResult> {
+  const anthropic = getAnthropicClient();
+
+  const systemPrompt = `You are a quality reviewer for church/event presentation slides in ProPresenter.
+
+Review the generated slides against the style guide and provide a brief report:
+1. Overall quality (1 sentence)
+2. Any specific slides that don't match the expected style (cite by slide number and title)
+3. One concrete suggestion if applicable
+
+Keep the review to 3-5 sentences. Be encouraging but honest.`;
+
+  const slideSummary = params.slides
+    .slice(0, 20)
+    .map(
+      (s, i) =>
+        `Slide ${i + 1} (${s.slideType}): title="${s.title}" body="${s.body.slice(0, 80)}${s.body.length > 80 ? "…" : ""}"`
+    )
+    .join("\n");
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: systemPrompt,
+    messages: [
+      {
+        role: "user",
+        content: `Presentation: ${params.presentationTitle}\nStyle Guide: ${params.styleGuide || "(None)"}\n\nGenerated Slides:\n${slideSummary}`,
+      },
+    ],
+    temperature: 0.5,
+    max_tokens: 400,
+  });
+
+  const message =
+    response.content[0]?.type === "text" ? response.content[0].text.trim() : "Slides look good!";
+  return { message };
+}
+
 export async function extractStyleGuideTextFromImage(imageDataUrl: string): Promise<string> {
   if (!/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(imageDataUrl)) {
     throw new Error("Unsupported style guide image format. Please use PNG, JPG, or WebP.");
@@ -650,4 +1045,103 @@ export async function extractStyleGuideTextFromImage(imageDataUrl: string): Prom
   }
 
   return extractedText;
+}
+
+const ZONE_DETECTION_SYSTEM_PROMPT = `You are analyzing a presentation slide background/template image for ProPresenter, a live presentation tool used in churches and live events.
+
+Your job is to find where text should be overlaid on this template: a "title" region and/or a "body" region.
+
+Rules:
+- Only propose a region over empty/open space in the design — never over faces, logos, or busy graphic elements.
+- Coordinates are percentages of the full image: x/y is the top-left corner (0-100), width/height are the box size as a percentage of image width/height.
+- Leave at least 4-6% margin from the image edges so text isn't clipped.
+- If the design clearly has separate heading and body treatments (different sizes/positions), return both title and body as non-overlapping boxes, with body positioned below or after the title.
+- If the design has only one clear open text area, return only "body" and set "title" to null.
+- If no area looks intended for text, return both as null.
+- Respond ONLY with valid JSON, no markdown fencing: {"title": {"x":n,"y":n,"width":n,"height":n} | null, "body": {"x":n,"y":n,"width":n,"height":n} | null}`;
+
+function clampZonePercent(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function sanitizeZoneBox(box: unknown): ZoneBox | undefined {
+  if (!box || typeof box !== "object") return undefined;
+  const candidate = box as Partial<ZoneBox>;
+  if (
+    typeof candidate.x !== "number" ||
+    typeof candidate.y !== "number" ||
+    typeof candidate.width !== "number" ||
+    typeof candidate.height !== "number"
+  ) {
+    return undefined;
+  }
+
+  const width = clampZonePercent(candidate.width, 5, 100);
+  const height = clampZonePercent(candidate.height, 5, 100);
+  const x = clampZonePercent(candidate.x, 0, 100 - width);
+  const y = clampZonePercent(candidate.y, 0, 100 - height);
+
+  return { x, y, width, height };
+}
+
+function parseZoneDetectionResponse(content: string): TemplateZones {
+  const firstBrace = content.indexOf("{");
+  const lastBrace = content.lastIndexOf("}");
+  if (firstBrace < 0 || lastBrace <= firstBrace) {
+    throw new Error("Could not parse zone detection response.");
+  }
+
+  const parsed = JSON.parse(content.slice(firstBrace, lastBrace + 1)) as {
+    title?: unknown;
+    body?: unknown;
+  };
+
+  return {
+    title: sanitizeZoneBox(parsed.title),
+    body: sanitizeZoneBox(parsed.body),
+  };
+}
+
+/**
+ * Uses vision to propose title/body text zones for a template image, so the
+ * user can start from a suggestion instead of drawing zones from scratch.
+ */
+export async function detectTemplateZones(params: {
+  imageDataUrl: string;
+  styleGuide?: string;
+}): Promise<TemplateZones> {
+  const parsed = parseImageDataUrl(params.imageDataUrl);
+  if (!parsed) {
+    throw new Error("Could not parse template image data URL.");
+  }
+
+  const anthropic = getAnthropicClient();
+
+  const userText = params.styleGuide
+    ? `Style guide / design instructions for context:\n${trimForPrompt(params.styleGuide, 1200)}\n\nAnalyze this template image and identify the text zones.`
+    : "Analyze this template image and identify the text zones.";
+
+  const response = await anthropic.messages.create({
+    model: SLIDE_GENERATION_MODEL,
+    system: ZONE_DETECTION_SYSTEM_PROMPT,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: userText },
+          { type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } },
+        ],
+      },
+    ],
+    temperature: 0,
+    max_tokens: 400,
+  });
+
+  const rawContent = response.content[0]?.type === "text" ? response.content[0].text.trim() : null;
+  if (!rawContent) {
+    throw new Error("No response from zone detection.");
+  }
+
+  return parseZoneDetectionResponse(rawContent);
 }

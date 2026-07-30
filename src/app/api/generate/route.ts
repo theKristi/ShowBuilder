@@ -8,6 +8,7 @@ export async function POST(req: NextRequest) {
     const {
       styleGuide,
       styleGuideImageDataUrl,
+      styleGuideImageDataUrls,
       templateSlideImageDataUrls,
       presentationNotes,
       presentationNotesFileDataUrl,
@@ -16,6 +17,7 @@ export async function POST(req: NextRequest) {
     } = body as {
       styleGuide: string;
       styleGuideImageDataUrl?: string;
+      styleGuideImageDataUrls?: string[];
       templateSlideImageDataUrls?: string[];
       presentationNotes: string;
       presentationNotesFileDataUrl?: string;
@@ -57,11 +59,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const resolvedStyleGuideImages = (styleGuideImageDataUrls ?? []).filter((url) =>
+      /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(url)
+    );
+
     const { slides, fallbackTypes } = await generateSlides({
       styleGuide: resolvedStyleGuide,
       presentationNotes: resolvedPresentationNotes,
       presentationTitle,
       templateSlideImageDataUrls: resolvedTemplateSlideImages,
+      styleGuideImageDataUrls: resolvedStyleGuideImages,
       zoneMap,
     });
 
