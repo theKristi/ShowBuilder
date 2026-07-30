@@ -1,13 +1,13 @@
 # ShowBuilder
 
-An AI-powered slide builder for ProPresenter. Paste or upload a style guide and your presentation notes, and ShowBuilder uses OpenAI to generate a ready-to-import `.pro6` file in seconds.
+An AI-powered slide builder for ProPresenter. Paste or upload a style guide and your presentation notes, and ShowBuilder uses Claude to generate a ready-to-import `.pro6` file in seconds.
 
 ![ShowBuilder UI](https://github.com/user-attachments/assets/1335a538-2600-454e-8b15-669eb8c5f54d)
 
 ## Features
 
-- **AI-generated slides** using OpenAI GPT-4o-mini
-- **Style guide support** — type instructions or upload a `.txt`/`.md`/`.json` file
+- **AI-generated slides** using Claude (Anthropic)
+- **Style guide support** — type instructions or upload a `.txt`/`.md`/`.json` file, or images
 - **Slide preview** with toggleable presenter notes
 - **One-click download** of a ProPresenter 6 (`.pro6`) file importable into ProPresenter 6 or 7
 
@@ -16,7 +16,7 @@ An AI-powered slide builder for ProPresenter. Paste or upload a style guide and 
 ### Prerequisites
 
 - Node.js 18+ and npm
-- An [OpenAI API key](https://platform.openai.com/api-keys)
+- An [Anthropic API key](https://console.anthropic.com/settings/keys)
 
 ### Setup
 
@@ -25,14 +25,14 @@ An AI-powered slide builder for ProPresenter. Paste or upload a style guide and 
    npm install
    ```
 
-2. Create a `.env.local` file from the example:
+2. Create a `.env.local` file:
    ```bash
-   cp .env.example .env.local
+   touch .env.local
    ```
 
-3. Add your OpenAI API key to `.env.local`:
+3. Add your Anthropic API key to `.env.local`:
    ```
-   OPENAI_API_KEY=sk-...
+   ANTHROPIC_API_KEY=sk-ant-...
    ```
 
 4. Start the development server:
@@ -54,9 +54,14 @@ An AI-powered slide builder for ProPresenter. Paste or upload a style guide and 
 
 - [Next.js 16](https://nextjs.org/) – React framework with App Router
 - [Tailwind CSS v4](https://tailwindcss.com/) – utility-first styling
-- [OpenAI Node SDK](https://github.com/openai/openai-node) – GPT-4o-mini via JSON mode
+- [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-typescript) – Claude for slide generation, style review, and template zone detection
 
 ## Deploy on Vercel
 
-The easiest way to deploy this app is with [Vercel](https://vercel.com/new). Add your `OPENAI_API_KEY` as an environment variable in the Vercel dashboard.
+The easiest way to deploy this app is with [Vercel](https://vercel.com/new):
+
+1. Import the `theKristi/ShowBuilder` GitHub repo at [vercel.com/new](https://vercel.com/new).
+2. Vercel auto-detects Next.js — no build config changes needed.
+3. Add an environment variable: `ANTHROPIC_API_KEY` (your key from the [Anthropic Console](https://console.anthropic.com/settings/keys)).
+4. Deploy. Optional env vars `ANTHROPIC_GENERATE_MODEL` and `ANTHROPIC_OCR_MODEL` override the default models if needed.
 
